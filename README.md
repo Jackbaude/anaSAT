@@ -43,7 +43,7 @@ python plot_satellite_cli.py 2025-04-23-11-00-00 --connections --latency --windo
 
 2. With observer location:
 ```bash
-python plot_satellite_cli.py 2025-04-23-11-00-00 --lat 45.0 --lon -93.0 --alt 234.5 --connections --latency --window
+python plot_satellite_cli.py 2025-04-23-11-00-00 --lat 11.1 --lon -11.1 --alt 111.11--connections --latency --window
 ```
 
 3. With custom output directory:
