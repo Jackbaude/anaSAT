@@ -60,3 +60,4 @@ The script generates the following plots in the specified output directory:
 - Satellite trajectories (if observer location is provided)
 
 Each plot is saved as a separate PNG file with the timestamp in the filename.
+![image](https://github.com/user-attachments/assets/9150f70a-c7c2-42be-a2c4-5a36a101f339)
