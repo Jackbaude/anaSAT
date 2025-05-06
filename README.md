@@ -1,63 +1,130 @@
-# Satellite Analysis CLI
+# Satellite Data Processing Tool
 
-This tool analyzes and visualizes satellite connection data, including trajectories and latency information.
+A Python tool for processing and analyzing Starlink satellite connection data, including serving satellite information, latency measurements, and GRPC status data.
 
-## Prerequisites
+## Overview
 
-- Python 3.x
-- Required Python packages (install using `pip install -r requirements.txt`):
-  - pandas
-  - matplotlib
-  - cartopy
-  - skyfield
+This tool processes various types of satellite-related data files and combines them into a comprehensive dataset for analysis. It handles:
+- Serving satellite data (which satellite is currently connected)
+- TLE (Two-Line Element) data for satellite orbital information
+- Ping latency measurements
+- GRPC status data
 
-## Running the CLI
+## Data Structure
 
-The main script `plot_satellite_cli.py` can be run with the following command:
+The tool expects data files to be organized in the following structure:
 
-```bash
-python plot_satellite_cli.py <timestamp> [options]
+```
+data/
+├── serving_satellite_data-YYYY-MM-DD-HH-MM-SS.csv
+├── TLE/
+│   └── YYYY-MM-DD/
+│       └── starlink-tle-YYYY-MM-DD-HH-MM-SS.txt
+├── latency/
+│   └── YYYY-MM-DD/
+│       └── ping-100ms-YYYY-MM-DD-HH-MM-SS.txt
+└── grpc/
+    └── YYYY-MM-DD/
+        └── GRPC_STATUS-YYYY-MM-DD-HH-MM-SS.csv
 ```
 
-### Required Arguments
+### Input File Formats
 
-- `<timestamp>`: The timestamp of the data to analyze (format: YYYY-MM-DD-HH-MM-SS)
-  Example: `2025-04-23-11-00-00`
+1. **Serving Satellite Data** (`serving_satellite_data-*.csv`):
+   - Contains information about which satellite is currently serving
+   - Columns: Timestamp, Connected_Satellite, Distance, etc.
 
-### Optional Arguments
+2. **TLE Data** (`starlink-tle-*.txt`):
+   - Contains orbital elements for Starlink satellites
+   - Format: Three lines per satellite (name, line1, line2)
 
-- `--lat LATITUDE`: Observer's latitude (default: None)
-- `--lon LONGITUDE`: Observer's longitude (default: None)
-- `--alt ALTITUDE`: Observer's altitude in meters (default: None)
-- `--connections`: Plot satellite connections
-- `--latency`: Plot latency data
-- `--window`: Plot 2-minute window view
-- `--output-dir OUTPUT_DIR`: Directory to save plots (default: timestamp_figures)
+3. **Ping Data** (`ping-100ms-*.txt`):
+   - Contains latency measurements
+   - Format: `[timestamp] ... time=latency ms`
 
-### Examples
+4. **GRPC Status** (`GRPC_STATUS-*.csv`):
+   - Contains GRPC connection status and metrics
+   - Columns: timestamp, popPingLatencyMs, downlinkThroughputBps, uplinkThroughputBps
 
-1. Basic usage with all plots:
+## Output Files
+
+The tool generates the following output files in the specified output directory:
+
+1. `combined_serving_satellite.csv`:
+   - Combined serving satellite data with TLE information
+   - Columns: Timestamp, Connected_Satellite, Distance, TLE_Line1, TLE_Line2, TLE_Timestamp
+
+2. `combined_ping_data.csv`:
+   - Combined ping latency measurements
+   - Columns: Timestamp, Latency_ms
+
+3. `combined_grpc_data.csv`:
+   - Combined GRPC status data
+   - Columns: timestamp, popPingLatencyMs, downlinkThroughputBps, uplinkThroughputBps
+
+4. `connection_periods.csv`:
+   - Analysis of satellite connection periods
+   - Columns: Satellite, Start_Time, End_Time, Duration_Seconds, Max_Distance, Min_Distance, First_Distance, Last_Distance, Mean_Distance, Std_Distance, TLE_Line1, TLE_Line2, TLE_Timestamp
+
+## Usage
+
 ```bash
-python plot_satellite_cli.py 2025-04-23-11-00-00 --connections --latency --window
+python process_satellite_data_dev.py --start YYYY-MM-DD-HH-MM-SS --end YYYY-MM-DD-HH-MM-SS [--output_dir OUTPUT_DIR]
 ```
 
-2. With observer location:
+### Arguments
+
+- `--start`: Start time in format YYYY-MM-DD-HH-MM-SS (required)
+- `--end`: End time in format YYYY-MM-DD-HH-MM-SS (required)
+- `--output_dir`: Output directory for CSV files (default: 'output')
+
+### Example
+
 ```bash
-python plot_satellite_cli.py 2025-04-23-11-00-00 --lat 11.1 --lon -11.1 --alt 111.11--connections --latency --window
+python process_satellite_data_dev.py --start 2025-04-20-23-00-00 --end 2025-05-02-19-00-00 --output_dir analysis_results
 ```
 
-3. With custom output directory:
+## Features
+
+1. **Progress Tracking**:
+   - Progress bars for file loading and processing
+   - Real-time status updates
+   - Estimated time remaining
+
+2. **Error Handling**:
+   - Graceful handling of missing files
+   - Warning messages for missing data
+   - Detailed error reporting
+
+3. **Data Processing**:
+   - Automatic TLE data matching with serving satellites
+   - Connection period analysis
+   - Statistical calculations for each connection period
+
+4. **Output Organization**:
+   - Chronologically sorted data
+   - Combined datasets for easy analysis
+   - Comprehensive connection period analysis
+
+## Dependencies
+
+- Python 3.6+
+- pandas
+- numpy
+- tqdm
+
+## Installation
+
+1. Clone the repository
+2. Install dependencies:
 ```bash
-python plot_satellite_cli.py 2025-04-23-11-00-00 --connections --latency --window --output-dir my_plots
+pip install pandas numpy tqdm
 ```
 
-## Output
+## Notes
 
-The script generates the following plots in the specified output directory:
-- Satellite connections over time
-- Latency measurements
-- 2-minute detailed window view
-- Satellite trajectories (if observer location is provided)
-
-Each plot is saved as a separate PNG file with the timestamp in the filename.
-![image](https://github.com/user-attachments/assets/9150f70a-c7c2-42be-a2c4-5a36a101f339)
+- The tool processes data in one-minute intervals
+- TLE data is matched with serving satellite data at each timestamp
+- Connection periods are determined by changes in the serving satellite
+- Missing data is handled gracefully with appropriate warnings
+- All timestamps are in UTC
