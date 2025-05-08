@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """
 Script to analyze satellite connections and latency data.
+
+This script processes satellite connection data, including:
+- Satellite position and connection data
+- Network latency measurements (ping)
+- gRPC status information
+- TLE (Two-Line Element) data for satellite positions
+
+The script combines these data sources to analyze satellite connections,
+calculate altitudes, and track connection periods with various metrics.
 """
 
 import pandas as pd
 import os
-import sys
 import re
 from datetime import datetime, timezone, timedelta
 import logging
 import argparse
 import numpy as np
 import glob
-from typing import List, Dict, Any
-import json
+from typing import List, Dict, Any, Optional, Callable
 from tqdm import tqdm
-from skyfield.api import load, EarthSatellite, wgs84
+from pathlib import Path
+from datetime import datetime
+from skyfield.api import EarthSatellite, load, wgs84
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 # Configure logging
 logging.basicConfig(
@@ -26,18 +37,72 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class SatelliteDataProcessor:
+    """
+    A class to process and analyze satellite connection data.
+
+    This class handles the loading, processing, and analysis of various data sources:
+    - Satellite connection data (position, elevation, azimuth)
+    - Network latency measurements
+    - gRPC status information
+    - TLE data for satellite positions
+
+    The class combines these data sources to create comprehensive analysis of satellite
+    connections, including connection periods, altitudes, and performance metrics.
+
+    Attributes:
+        output_dir (str): Directory where processed data will be saved
+        ts (Timescale): Skyfield timescale object for satellite calculations
+        file_regex (Pattern): Compiled regex for matching satellite data files
+        max_workers (int): Number of workers for parallel processing
+        merge_tolerance (Timedelta): Time tolerance for merging dataframes
+    """
+
     def __init__(self, output_dir: str = 'output'):
-        """Initialize the SatelliteDataProcessor."""
+        """
+        Initialize the SatelliteDataProcessor.
+
+        Args:
+            output_dir (str): Directory where processed data will be saved
+        """
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Initialize commonly used values
+        self.ts = load.timescale()  # Skyfield timescale object used in multiple methods
+        self.file_regex = re.compile(r'serving_satellite_data-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.csv')
+        self.max_workers = 8  # Number of workers for parallel processing
+        self.merge_tolerance = pd.Timedelta(seconds=1)  # Tolerance for merging dataframes
+
+        self.tle_cache = {}  # In-memory cache for TLE data
+    
 
     @staticmethod
     def parse_timestamp(ts: str) -> datetime:
-        """Parse timestamp string into datetime object."""
+        """
+        Parse timestamp string into datetime object.
+
+        Args:
+            ts (str): Timestamp string in format 'YYYY-MM-DD-HH-MM-SS'
+
+        Returns:
+            datetime: Parsed datetime object with UTC timezone
+        """
         return datetime.strptime(ts, "%Y-%m-%d-%H-%M-%S").replace(tzinfo=timezone.utc)
 
     def load_tle_data(self, timestamp: datetime) -> Dict[str, Dict[str, str]]:
-        """Load TLE data for a specific timestamp."""
+        """
+        Load TLE (Two-Line Element) data for a specific timestamp.
+
+        Args:
+            timestamp (datetime): The timestamp for which to load TLE data
+
+        Returns:
+            Dict[str, Dict[str, str]]: Dictionary mapping satellite names to their TLE data
+            Each satellite entry contains:
+                - line1: First line of TLE data
+                - line2: Second line of TLE data
+                - timestamp: When the TLE data was recorded
+        """
         date_str = timestamp.strftime('%Y-%m-%d')
         tle_file = os.path.join('data', 'TLE', date_str, f"starlink-tle-{date_str}-{timestamp.strftime('%H-%M-%S')}.txt")
         
@@ -56,81 +121,119 @@ class SatelliteDataProcessor:
                                 'line2': line2,
                                 'timestamp': timestamp
                             }
-                # print(f"Loaded TLE data from {tle_file}")
             except Exception as e:
                 print(f"Error loading TLE file {tle_file}: {e}")
         
-        return tle_data
+        return tle_data 
+
+    def get_matching_serving_satellite_files(self, start_time: datetime, end_time: datetime) -> List[tuple[datetime, Path]]:
+        """
+        Find satellite data files that fall within the specified time window.
+
+        Args:
+            start_time (datetime): Start of the time window
+            end_time (datetime): End of the time window
+
+        Returns:
+            List[tuple[datetime, Path]]: List of tuples containing (file_time, file_path)
+            for each matching file
+        """
+        files = sorted(Path("data").glob("serving_satellite_data-*.csv"))
+        matched = []
+        for f in files:
+            match = self.file_regex.search(f.name)
+            if match:
+                file_time = datetime.strptime(match.group(1), "%Y-%m-%d-%H-%M-%S").replace(tzinfo=timezone.utc)
+                if start_time <= file_time <= end_time:
+                    matched.append((file_time, f))
+        return matched
+
+    def process_satellite_file(self, file_time: datetime, file_path: Path, ts: Any, load_tle_data_fn: Callable[[datetime], Dict[str, Dict[str, str]]]) -> pd.DataFrame:
+        """
+        Process a single satellite data file, adding TLE data and computing altitudes.
+
+        Args:
+            file_time (datetime): Timestamp associated with the file
+            file_path (Path): Path to the satellite data file
+            ts (Any): Skyfield timescale object
+            load_tle_data_fn (Callable): Function to load TLE data for a timestamp
+
+        Returns:
+            pd.DataFrame: Processed satellite data with added TLE and altitude information
+        """
+        tle_data = load_tle_data_fn(file_time)
+
+        try:
+            # Read CSV file with proper datetime parsing
+            df = pd.read_csv(file_path, parse_dates=['Timestamp'])
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'], utc=True)
+
+            # Add TLE data columns
+            df['TLE_Line1'] = df['Connected_Satellite'].map(lambda x: tle_data.get(x, {}).get('line1'))
+            df['TLE_Line2'] = df['Connected_Satellite'].map(lambda x: tle_data.get(x, {}).get('line2'))
+            df['TLE_Timestamp'] = df['Connected_Satellite'].map(lambda x: tle_data.get(x, {}).get('timestamp'))
+
+            def compute_altitude(row) -> Optional[float]:
+                """
+                Compute satellite altitude using TLE data.
+
+                Args:
+                    row: DataFrame row containing satellite and TLE data
+
+                Returns:
+                    Optional[float]: Satellite altitude in kilometers, or None if calculation fails
+                """
+                try:
+                    if pd.notna(row.TLE_Line1) and pd.notna(row.TLE_Line2):
+                        sat = EarthSatellite(row.TLE_Line1, row.TLE_Line2, row.Connected_Satellite, ts)
+                        t = ts.from_datetime(row.Timestamp.to_pydatetime())
+                        return wgs84.subpoint(sat.at(t)).elevation.km
+                except Exception as e:
+                    print(f"Altitude error for {row.Connected_Satellite}: {e}")
+                return None
+
+            # Compute altitudes in parallel
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                df['Altitude_km'] = list(executor.map(compute_altitude, df.itertuples(index=False)))
+
+            return df
+
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
+            return pd.DataFrame()
 
     def load_serving_satellite_data(self, start_time: datetime, end_time: datetime, ping_df: pd.DataFrame, grpc_df: pd.DataFrame) -> pd.DataFrame:
-        """Load and combine all serving satellite data files within the time window."""
+        """
+        Load and combine satellite data with ping and gRPC data.
+
+        Args:
+            start_time (datetime): Start of the time window
+            end_time (datetime): End of the time window
+            ping_df (pd.DataFrame): DataFrame containing ping latency data
+            grpc_df (pd.DataFrame): DataFrame containing gRPC status data
+
+        Returns:
+            pd.DataFrame: Combined satellite data with ping and gRPC information
+        """
         print("Loading serving satellite data...")
-        all_data = []
-        
-        # Calculate total hours for progress bar
-        total_hours = int((end_time - start_time).total_seconds() / 3600) + 1
-        
-        # Find all relevant files
-        current_time = start_time
-        with tqdm(total=total_hours, desc="Loading serving satellite files") as pbar:
-            while current_time <= end_time:
-                date_str = current_time.strftime('%Y-%m-%d')
-                hour_str = current_time.strftime('%H')
-                
-                # Load TLE data for this hour
-                tle_data = self.load_tle_data(current_time)
-                
-                # Process all files for this hour
-                while current_time <= end_time and current_time.strftime('%H') == hour_str:
-                    file_path = os.path.join('data', f"serving_satellite_data-{date_str}-{current_time.strftime('%H-%M-%S')}.csv")
-                    
-                    if os.path.exists(file_path):
-                        try:
-                            # Load serving satellite data
-                            df = pd.read_csv(file_path)
-                            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-                            
-                            # Add TLE data to the DataFrame
-                            df['TLE_Line1'] = df['Connected_Satellite'].map(lambda x: tle_data.get(x, {}).get('line1', None))
-                            df['TLE_Line2'] = df['Connected_Satellite'].map(lambda x: tle_data.get(x, {}).get('line2', None))
-                            df['TLE_Timestamp'] = df['Connected_Satellite'].map(lambda x: tle_data.get(x, {}).get('timestamp', None))
-                            
-                            # Calculate altitude for each satellite
-                            ts = load.timescale()
-                            altitudes = []
-                            for _, row in df.iterrows():
-                                if pd.notna(row['TLE_Line1']) and pd.notna(row['TLE_Line2']):
-                                    try:
-                                        satellite = EarthSatellite(row['TLE_Line1'], row['TLE_Line2'], row['Connected_Satellite'], ts)
-                                        t = ts.from_datetime(row['Timestamp'].to_pydatetime())
-                                        geocentric = satellite.at(t)
-                                        subpoint = wgs84.subpoint(geocentric)
-                                        altitudes.append(subpoint.elevation.km)
-                                    except Exception as e:
-                                        print(f"Error calculating altitude for {row['Connected_Satellite']}: {e}")
-                                        altitudes.append(None)
-                                else:
-                                    altitudes.append(None)
-                            
-                            df['Altitude_km'] = altitudes
-                            
-                            all_data.append(df)
-                            pbar.set_postfix({'file': os.path.basename(file_path)})
-                        except Exception as e:
-                            print(f"Error loading {file_path}: {e}")
-                    
-                    current_time += timedelta(hours=1)
-                
-                pbar.update(1)
-        
-        if not all_data:
-            print("Warning: No serving satellite data files found in the specified time window")
+        matched_files = self.get_matching_serving_satellite_files(start_time, end_time)
+
+        if not matched_files:
+            print("No matching serving satellite files found")
             return pd.DataFrame()
-        
-        print("Combining serving satellite data...")
+
+        all_data = []
+        for file_time, file_path in tqdm(matched_files, desc="Loading satellite files"):
+            df = self.process_satellite_file(file_time, file_path, self.ts, self.load_tle_data)
+            if not df.empty:
+                all_data.append(df)
+
+        if not all_data:
+            return pd.DataFrame()
+
         combined_df = pd.concat(all_data, ignore_index=True).sort_values('Timestamp')
-        
-        # Merge ping data if available
+
+        # Merge ping data
         if not ping_df.empty:
             print("Merging ping data...")
             combined_df = pd.merge_asof(
@@ -138,80 +241,117 @@ class SatelliteDataProcessor:
                 ping_df.sort_values('Timestamp'),
                 on='Timestamp',
                 direction='nearest',
-                tolerance=pd.Timedelta(seconds=1)
+                tolerance=self.merge_tolerance
             )
-        
-        # Merge GRPC data if available
+
+        # Merge gRPC data
         if not grpc_df.empty:
             print("Merging GRPC data...")
-            # Rename timestamp column in GRPC data to match
             grpc_df = grpc_df.rename(columns={'timestamp': 'Timestamp'})
-            # Select all columns except Timestamp
             grpc_columns = [col for col in grpc_df.columns if col != 'Timestamp']
-            # Merge GRPC data based on closest timestamp
             combined_df = pd.merge_asof(
                 combined_df.sort_values('Timestamp'),
                 grpc_df[['Timestamp'] + grpc_columns].sort_values('Timestamp'),
                 on='Timestamp',
                 direction='nearest',
-                tolerance=pd.Timedelta(seconds=1)
+                tolerance=self.merge_tolerance
             )
-        
+
         return combined_df
 
+    def load_single_ping_file(self, file_path: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        """
+        Load ping data from a single file, filtering timestamps within the range.
+
+        Args:
+            file_path (str): Path to the ping data file
+            start_time (datetime): Start of the time window
+            end_time (datetime): End of the time window
+
+        Returns:
+            pd.DataFrame: DataFrame containing ping latency data
+        """
+        try:
+            # Pre-compile regex pattern
+            pattern = re.compile(r'\[(\d+\.\d+)\].*time=(\d+\.\d+)\s+ms')
+            
+            # Read file content
+            with open(file_path, 'r') as f:
+                content = f.read()
+            
+            # Find all matches at once
+            matches = pattern.findall(content)
+            
+            if not matches:
+                return pd.DataFrame(columns=['Timestamp', 'Latency_ms'])
+            
+            # Convert matches to DataFrame using vectorized operations
+            df = pd.DataFrame(matches, columns=['timestamp', 'latency'])
+            df['timestamp'] = pd.to_numeric(df['timestamp'])
+            df['latency'] = pd.to_numeric(df['latency'])
+            
+            # Convert timestamps to datetime using vectorized operation
+            df['Timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+            df['Latency_ms'] = df['latency']
+            
+            # Filter by time range
+            mask = (df['Timestamp'] >= start_time) & (df['Timestamp'] <= end_time)
+            df = df[mask][['Timestamp', 'Latency_ms']]
+            
+            return df
+            
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            return pd.DataFrame(columns=['Timestamp', 'Latency_ms'])
+
     def load_ping_data(self, start_time: datetime, end_time: datetime) -> pd.DataFrame:
-        """Load and combine all ping data files within the time window."""
-        # print("Loading ping data...")
+        """
+        Load and combine all ping data files within the time window.
+
+        Args:
+            start_time (datetime): Start of the time window
+            end_time (datetime): End of the time window
+
+        Returns:
+            pd.DataFrame: Combined ping latency data
+        """
         all_data = []
-        
-        # Calculate total minutes for progress bar
-        total_minutes = int((end_time - start_time).total_seconds() / 60) + 1
-        
+        total_hours = int((end_time - start_time).total_seconds() / 3600) + 1
+
         current_time = start_time
-        with tqdm(total=total_minutes, desc="Loading ping files") as pbar:
+        with tqdm(total=total_hours, desc="Loading ping files") as pbar:
             while current_time <= end_time:
                 date_str = current_time.strftime('%Y-%m-%d')
                 ping_file = os.path.join('data', 'latency', date_str, f"ping-100ms-{date_str}-{current_time.strftime('%H-%M-%S')}.txt")
                 
                 if os.path.exists(ping_file):
-                    try:
-                        with open(ping_file, 'r') as f:
-                            data = []
-                            for line in f:
-                                match = re.match(r'\[(\d+\.\d+)\].*time=(\d+\.\d+)\s+ms', line)
-                                if match:
-                                    timestamp = float(match.group(1))
-                                    latency = float(match.group(2))
-                                    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                                    if start_time <= dt <= end_time:
-                                        data.append({
-                                            'Timestamp': dt,
-                                            'Latency_ms': latency
-                                        })
-                        if data:
-                            df = pd.DataFrame(data)
-                            all_data.append(df)
-                            pbar.set_postfix({'file': os.path.basename(ping_file)})
-                    except Exception as e:
-                        print(f"Error loading {ping_file}: {e}")
-                
+                    df = self.load_single_ping_file(ping_file, start_time, end_time)
+                    if not df.empty:
+                        all_data.append(df)
+                        pbar.set_postfix({'file': os.path.basename(ping_file)})
+
                 current_time += timedelta(hours=1)
                 pbar.update(1)
-        
+
         if not all_data:
             print("Warning: No ping data files found in the specified time window")
             return pd.DataFrame(columns=['Timestamp', 'Latency_ms'])
-        
+
         print("Combining ping data...")
-        combined_df = pd.concat(all_data, ignore_index=True).sort_values('Timestamp')
-        return combined_df
+        return pd.concat(all_data, ignore_index=True).sort_values('Timestamp')
 
     def load_grpc_data(self, start_time: datetime, end_time: datetime) -> pd.DataFrame:
-        """Load and combine all GRPC status files within the time window."""
-        # print("Loading GRPC data...")
+        """
+        Load and combine all GRPC status files within the time window.
+
+        Args:
+            start_time (datetime): Start of the time window
+            end_time (datetime): End of the time window
+
+        Returns:
+            pd.DataFrame: Combined gRPC status data
+        """
         all_data = []
-        
-        # Calculate total minutes for progress bar
         total_minutes = int((end_time - start_time).total_seconds() / 60) + 1
         
         current_time = start_time
@@ -242,7 +382,19 @@ class SatelliteDataProcessor:
         return combined_df
 
     def create_connection_periods_csv(self, serving_df: pd.DataFrame, output_file: str):
-        """Create a CSV file with unique satellite connection periods."""
+        """
+        Create a CSV file with unique satellite connection periods.
+
+        This method analyzes the serving satellite data to identify distinct connection
+        periods for each satellite, calculating various metrics for each period.
+
+        Args:
+            serving_df (pd.DataFrame): DataFrame containing serving satellite data
+            output_file (str): Path where the connection periods CSV will be saved
+
+        Returns:
+            pd.DataFrame: DataFrame containing connection period data
+        """
         print("Creating connection periods CSV...")
         periods = []
         current_sat = None
@@ -252,6 +404,18 @@ class SatelliteDataProcessor:
         rows = serving_df.to_dict('records')
         
         def append_period(satellite, start, end, data):
+            """
+            Create a period entry with calculated metrics.
+
+            Args:
+                satellite (str): Satellite identifier
+                start (datetime): Start time of the period
+                end (datetime): End time of the period
+                data (list): List of data points in the period
+
+            Returns:
+                dict: Dictionary containing period metrics
+            """
             distances = [d['Distance'] for d in data if pd.notna(d['Distance'])]
             altitudes = [d['Altitude_km'] for d in data if pd.notna(d['Altitude_km'])]
             latencies = [d['Latency_ms'] for d in data if pd.notna(d['Latency_ms'])]
@@ -316,10 +480,21 @@ class SatelliteDataProcessor:
         print(f"Saved connection periods to {output_file}")
         return periods_df
 
-
-
     def process_data(self, start_time: datetime, end_time: datetime):
-        """Process all data within the specified time window."""
+        """
+        Process all data within the specified time window.
+
+        This method orchestrates the entire data processing pipeline:
+        1. Loads and combines ping data
+        2. Loads and combines gRPC data
+        3. Loads and processes satellite data
+        4. Creates connection period analysis
+        5. Saves all processed data to CSV files
+
+        Args:
+            start_time (datetime): Start of the time window
+            end_time (datetime): End of the time window
+        """
         print(f"Processing data from {start_time} to {end_time}")
         
         try:
@@ -367,6 +542,11 @@ class SatelliteDataProcessor:
             raise
 
 def main():
+    """
+    Main entry point for the script.
+    
+    Parses command line arguments and initiates data processing.
+    """
     parser = argparse.ArgumentParser(description='Process satellite connection data')
     parser.add_argument('--start', required=True, help='Start time (YYYY-MM-DD-HH-MM-SS)')
     parser.add_argument('--end', required=True, help='End time (YYYY-MM-DD-HH-MM-SS)')
