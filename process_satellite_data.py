@@ -569,68 +569,47 @@ class SatelliteDataProcessor:
         except Exception as e:
             logger.error(f"Error calculating satellite position: {e}")
             return None, None
-    def is_valid_satellite(self, alt, az, tilt_deg, rotation_deg, fov_azimuth, fov_elevation):
-        # """
-        # Check if a satellite is within the valid field of view.
+        
+    def is_valid_satellite(self, alt, az, tilt_deg, rotation_deg):
+        """
+        Check if a satellite is within the valid field of view.
 
-        # Args:
-        #     alt (float): Satellite altitude in degrees
-        #     az (float): Satellite azimuth in degrees
-        #     tilt_deg (float): Dish tilt angle in degrees
-        #     rotation_deg (float): Dish rotation angle in degrees
-        #     fov_azimuth (float): Field of view azimuth in degrees
-        #     fov_elevation (float): Field of view elevation in degrees
+        Args:
+            alt (float): Satellite altitude in degrees
+            az (float): Satellite azimuth in degrees
+            tilt_deg (float): Dish tilt angle in degrees
+            rotation_deg (float): Dish rotation angle in degrees
 
-        # Returns:
-        #     bool: True if satellite is within valid FOV, False otherwise
-        # """
-        # if alt is None or az is None:
-        #     return False
-            
-        # # Rotate azimuth based on dish rotation
-        # adjusted_azimuth = (az + rotation_deg) % 360
-        
-        # # Check if satellite is within FOV azimuth range
-        # azimuth_range = 110  # Width of the FOV in degrees
-        # if adjusted_azimuth < (fov_azimuth - azimuth_range) or adjusted_azimuth > (fov_azimuth + azimuth_range):
-        #     return False
-        
-        # # Check if satellite is within FOV elevation range
-        # fov_max_elevation = 90 - tilt_deg  # Max elevation based on tilt
-        # fov_min_elevation = 20  # Minimum elevation (adjust as necessary)
-        # if alt < fov_min_elevation or alt > fov_max_elevation:
-        #     return False
-        
-        # return True
-        base_radius = 60
+        Returns:
+            bool: True if satellite is within valid FOV, False otherwise
+        """
         if alt is None or az is None:
             return False
 
-        # Ellipse parameters
-        center_x = tilt_deg
-        center_y = 0
-        x_radius = base_radius
-        y_radius = math.sqrt(base_radius**2 - tilt_deg**2)
-        
-        # Satellite position in plot coordinates
+        # Convert satellite position to Cartesian coordinates
+        # r is distance from center (90 - alt to match the polar plot)
         r = 90 - alt
         theta = math.radians(az)
         x = r * math.cos(theta)
         y = r * math.sin(theta)
-        
+
         # Rotate point back to FOV frame
         angle_rad = math.radians(-rotation_deg)
         x_rot = x * math.cos(angle_rad) - y * math.sin(angle_rad)
         y_rot = x * math.sin(angle_rad) + y * math.cos(angle_rad)
 
         # Translate to ellipse center
-        dx = x_rot - center_x
-        dy = y_rot - center_y
+        dx = x_rot - tilt_deg
+        dy = y_rot
 
         # Check if inside ellipse equation
+        base_radius = 60  # Base radius of the FOV
+        x_radius = base_radius
+        y_radius = math.sqrt(base_radius**2 - tilt_deg**2)
+        
+        # Ellipse equation: (x/a)^2 + (y/b)^2 <= 1
         inside = (dx**2 / x_radius**2) + (dy**2 / y_radius**2) <= 1
         return inside
- 
 
     def compute_visibility_at_handovers(self, frame_type=2):
         """
@@ -687,7 +666,7 @@ class SatelliteDataProcessor:
                 alt, az = self.get_satellite_position(sat_data, ts)
                 
                 # Check if satellite is within valid FOV
-                if self.is_valid_satellite(alt, az, tilt_deg, rotation_deg, fov_azimuth, fov_elevation):
+                if self.is_valid_satellite(alt, az, tilt_deg, rotation_deg):
                     visible_sats.append({
                         'satellite': sat_data['satellite_name'],
                         'altitude_deg': alt,
