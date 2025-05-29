@@ -95,22 +95,18 @@ class SatelliteDataProcessor:
         """
         return datetime.strptime(ts, "%Y-%m-%d-%H-%M-%S").replace(tzinfo=timezone.utc)
     
-    def generate_handover_timestamps(self):
+    def generate_timestamps(self):
         """
-        Generate timestamps at 12, 27, 42, and 57 seconds of each minute between start and end time.
+        Generate timestamps for every second between start and end time.
         """
         current_time = self.start_time
-        handover_seconds = [12, 27, 42, 57]
         timestamps = []
 
         while current_time <= self.end_time:
-            for sec in handover_seconds:
-                ts = current_time.replace(second=sec, microsecond=0)
-                if ts <= self.end_time:
-                    timestamps.append(ts)
-            current_time += timedelta(minutes=1)
+            timestamps.append(current_time)
+            current_time += timedelta(seconds=1)
 
-        logger.info(f"Generated {len(timestamps)} handover timestamps")
+        logger.info(f"Generated {len(timestamps)} timestamps")
         return timestamps
     
     def load_tle_data(self, timestamp: datetime) -> pd.DataFrame:
@@ -481,7 +477,6 @@ class SatelliteDataProcessor:
             Returns:
                 dict: Dictionary containing period metrics
             """
-            distances = [d['Distance'] for d in data if pd.notna(d['Distance'])]
             altitudes = [d['Altitude_km'] for d in data if pd.notna(d['Altitude_km'])]
             latencies = [d['Latency_ms'] for d in data if pd.notna(d['Latency_ms'])]
             pop_latencies = [d['popPingLatencyMs'] for d in data if pd.notna(d['popPingLatencyMs'])]
@@ -492,18 +487,9 @@ class SatelliteDataProcessor:
                 'Start_Time': start,
                 'End_Time': end,
                 'Duration_Seconds': (end - start).total_seconds(),
-
-                'Max_Distance': max(distances) if distances else None,
-                'Min_Distance': min(distances) if distances else None,
-                'First_Distance': distances[0] if distances else None,
-                'Last_Distance': distances[-1] if distances else None,
-                'Mean_Distance': np.mean(distances) if distances else None,
-                'Std_Distance': np.std(distances) if distances else None,
-
                 'Mean_Altitude_km': np.mean(altitudes) if altitudes else None,
                 'Mean_Latency_ms': np.mean(latencies) if latencies else None,
                 'Mean_popPingLatencyMs': np.mean(pop_latencies) if pop_latencies else None,
-
                 'TLE_Line1': first_entry.get('TLE_Line1'),
                 'TLE_Line2': first_entry.get('TLE_Line2'),
                 'TLE_Timestamp': first_entry.get('TLE_Timestamp')
@@ -592,7 +578,7 @@ class SatelliteDataProcessor:
         theta = math.radians(az)
         x = r * math.cos(theta)
         y = r * math.sin(theta)
-
+        
         # Rotate point back to FOV frame
         angle_rad = math.radians(-rotation_deg)
         x_rot = x * math.cos(angle_rad) - y * math.sin(angle_rad)
@@ -603,17 +589,17 @@ class SatelliteDataProcessor:
         dy = y_rot
 
         # Check if inside ellipse equation
-        base_radius = 60  # Base radius of the FOV
+        base_radius = 50  # Base radius of the FOV
         x_radius = base_radius
         y_radius = math.sqrt(base_radius**2 - tilt_deg**2)
         
         # Ellipse equation: (x/a)^2 + (y/b)^2 <= 1
         inside = (dx**2 / x_radius**2) + (dy**2 / y_radius**2) <= 1
         return inside
-
-    def compute_visibility_at_handovers(self, frame_type=2):
+ 
+    def compute_visibility(self, frame_type=2):
         """
-        For each timestamp, compute visible satellites using dish parameters from GRPC data.
+        Compute visible satellites at each second using dish parameters from GRPC data.
         Loads combined serving satellite data if not already created.
 
         Returns:
@@ -634,10 +620,14 @@ class SatelliteDataProcessor:
             logger.error(f"Error loading combined serving satellite data: {e}")
             return {}
 
-        timestamps = self.generate_handover_timestamps()
+        timestamps = self.generate_timestamps()
         visibility_results = {}
         
-        # Process each handover timestamp
+        # Track FOV durations for each satellite
+        fov_durations = {}  # {satellite: [(start_time, end_time), ...]}
+        current_fov_sats = set()  # Set of satellites currently in FOV
+        
+        # Process each timestamp
         for ts in tqdm(timestamps, desc="Computing visibility"):
             # Get the closest GRPC data point for this timestamp
             mask = serving_df['Timestamp'] <= ts
@@ -660,15 +650,19 @@ class SatelliteDataProcessor:
                 logger.warning(f"No TLE data available for hour containing timestamp {ts}")
                 continue
             
-            visible_sats = []
+            visible_sats = set()  # Set of satellites visible at this timestamp
+            visible_sats_data = []  # List of detailed satellite data
+            
             for _, sat_data in tle_data.iterrows():
                 # Calculate satellite position
                 alt, az = self.get_satellite_position(sat_data, ts)
                 
                 # Check if satellite is within valid FOV
                 if self.is_valid_satellite(alt, az, tilt_deg, rotation_deg):
-                    visible_sats.append({
-                        'satellite': sat_data['satellite_name'],
+                    sat_name = sat_data['satellite_name']
+                    visible_sats.add(sat_name)
+                    visible_sats_data.append({
+                        'satellite': sat_name,
                         'altitude_deg': alt,
                         'azimuth_deg': az,
                         'tilt_deg': tilt_deg,
@@ -679,20 +673,72 @@ class SatelliteDataProcessor:
                         'tle_line2': sat_data['tle_line2']
                     })
             
-            if visible_sats:
-                visibility_results[ts.isoformat()] = visible_sats
+            # Update FOV durations
+            for sat in current_fov_sats - visible_sats:
+                # Satellite has left FOV
+                if sat in fov_durations:
+                    fov_durations[sat][-1] = (fov_durations[sat][-1][0], ts)
+                current_fov_sats.remove(sat)
+            
+            for sat in visible_sats - current_fov_sats:
+                # Satellite has entered FOV
+                if sat not in fov_durations:
+                    fov_durations[sat] = []
+                fov_durations[sat].append((ts, None))
+                current_fov_sats.add(sat)
+            
+            if visible_sats_data:
+                visibility_results[ts.isoformat()] = visible_sats_data
+                if len(visible_sats) > 0 and ts.second % 60 == 0:  # Log only once per minute
                 logger.info(f"{ts}: {len(visible_sats)} satellites visible")
+
+        # Close any open FOV durations at the end
+        for sat in current_fov_sats:
+            if sat in fov_durations and fov_durations[sat][-1][1] is None:
+                fov_durations[sat][-1] = (fov_durations[sat][-1][0], timestamps[-1])
+
+        # Calculate mean durations
+        mean_durations = self.calculate_mean_fov_durations(fov_durations)
 
         # Save visibility results to JSON
         if visibility_results:
             import json
             output_file = os.path.join(self.output_dir, 'satellite_visibility.json')
             with open(output_file, 'w') as f:
-                json.dump(visibility_results, f, indent=2)
+                json.dump({
+                    'visibility': visibility_results,
+                    'fov_durations': {sat: [(start.isoformat(), end.isoformat()) for start, end in periods] 
+                                    for sat, periods in fov_durations.items()},
+                    'mean_durations': mean_durations
+                }, f, indent=2)
             logger.info(f"Saved visibility results to {output_file}")
 
         return visibility_results
      
+    def calculate_mean_fov_durations(self, fov_durations):
+        """
+        Calculate mean duration in FOV for each satellite.
+
+        Args:
+            fov_durations (dict): Dictionary mapping satellite names to lists of (start_time, end_time) tuples
+
+        Returns:
+            dict: Dictionary mapping satellite names to mean duration in seconds
+        """
+        mean_durations = {}
+        for sat, periods in fov_durations.items():
+            total_duration = 0
+            for start, end in periods:
+                if end is not None:  # Skip incomplete periods
+                    duration = (end - start).total_seconds()
+                    total_duration += duration
+            if periods:
+                mean_durations[sat] = total_duration / len(periods)
+            else:
+                mean_durations[sat] = 0
+        
+        return mean_durations
+
     def process_data(self, start_time: datetime, end_time: datetime):
         """
         Process all data within the specified time window.
@@ -753,7 +799,7 @@ class SatelliteDataProcessor:
             
             # Compute and save satellite visibility
             print("Computing satellite visibility...")
-            visibility_results = self.compute_visibility_at_handovers()
+            visibility_results = self.compute_visibility()
             if visibility_results:
                 print(f"Computed visibility for {len(visibility_results)} timestamps")
             else:
