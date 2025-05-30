@@ -850,7 +850,7 @@ class SatelliteDataProcessor:
                 prev_handover = handover_seconds[-1]
                 if current_minute == 0:
                     current_minute = 59
-                    current_hour -= 1
+                    current_hour = (current_hour - 1) % 24  # Properly handle hour rollover
                 else:
                     current_minute -= 1
             
