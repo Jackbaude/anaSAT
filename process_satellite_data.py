@@ -81,12 +81,12 @@ def process_timestamp(ts, serving_df, processor, output_file):
             sat_name = sat_data['satellite_name']
             visible_sats_data.append({
                 'satellite': sat_name,
-                'altitude_deg': alt,
-                'azimuth_deg': az,
-                'tilt_deg': tilt_deg,
-                'rotation_deg': rotation_deg,
-                'fov_azimuth': fov_azimuth,
-                'fov_elevation': fov_elevation,
+                'sat_elevation_deg': alt,
+                'sat_azimuth_deg': az,
+                'UT_boresight_elevation': tilt_deg,
+                'UT_boresight_azimuth': rotation_deg,
+                'desired_boresight_azimuth': fov_azimuth,
+                'desired_boresight_elevation': fov_elevation,
                 'tle_line1': sat_data['tle_line1'],
                 'tle_line2': sat_data['tle_line2']
             })
@@ -111,7 +111,7 @@ def process_timestamp(ts, serving_df, processor, output_file):
                 
                 # Write back to file
                 with open(output_file, 'w') as f:
-                    json.dump(current_results, f, indent=2)
+                    json.dump(current_results, f)
                 
                 # Release the lock
                 fcntl.flock(lock_f, fcntl.LOCK_UN)
@@ -901,25 +901,26 @@ class SatelliteDataProcessor:
                 'TLE_Timestamp': first_entry.get('TLE_Timestamp')
             }
 
-            for i, row in enumerate(rows):
-                satellite = row['Connected_Satellite']
-                timestamp = row['Timestamp']
+        # Process rows to create periods
+        for i, row in enumerate(rows):
+            satellite = row['Connected_Satellite']
+            timestamp = row['Timestamp']
 
-                if current_sat is None:
-                    current_sat = satellite
-                    start_time = timestamp
-                    current_data = [row]
-                elif satellite == current_sat:
-                    current_data.append(row)
-                else:
-                    # Satellite switched, finalize current period
-                    end_time = current_data[-1]['Timestamp']
-                    periods.append(append_period(current_sat, start_time, end_time, current_data))
+            if current_sat is None:
+                current_sat = satellite
+                start_time = timestamp
+                current_data = [row]
+            elif satellite == current_sat:
+                current_data.append(row)
+            else:
+                # Satellite switched, finalize current period
+                end_time = current_data[-1]['Timestamp']
+                periods.append(append_period(current_sat, start_time, end_time, current_data))
 
-                    # Start new period
-                    current_sat = satellite
-                    start_time = timestamp
-                    current_data = [row]
+                # Start new period
+                current_sat = satellite
+                start_time = timestamp
+                current_data = [row]
 
         # Handle final period
         if current_sat is not None and current_data:
@@ -1056,7 +1057,8 @@ class SatelliteDataProcessor:
             # Process timestamps with progress bar
             processed = 0
             with tqdm(total=len(timestamps), desc="Computing visibility at handover times") as pbar:
-                for _ in pool.imap_unordered(process_func, timestamps):
+                # Use map instead of imap_unordered to ensure all timestamps are processed
+                for _ in pool.map(process_func, timestamps):
                     processed += 1
                     pbar.update(1)
         
