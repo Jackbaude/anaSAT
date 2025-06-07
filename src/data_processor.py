@@ -236,22 +236,15 @@ class DataProcessor:
 
         # Get unique timestamps from serving data
         timestamps = serving_df['Timestamp'].unique()
-        batch_size = 10
-        timestamp_batches = [timestamps[i:i + batch_size] for i in range(0, len(timestamps), batch_size)]
-        logger.info(f"Split {len(timestamps)} timestamps into {len(timestamp_batches)} batches")
         
-        tle_cache = {}
+        # Load TLE data for the entire time period
+        tle_data = {}
         current_hour = self.start_time.replace(minute=0, second=0, microsecond=0)
         while current_hour <= self.end_time:
-            tle_data = self.satellite_data.load_tle_data(current_hour)
-            if not tle_data.empty:
-                tle_cache[current_hour] = tle_data
-                logger.debug(f"Loaded TLE data for {current_hour} with {len(tle_data)} records")
+            tle_data[current_hour] = self.satellite_data.load_tle_data(current_hour)
             current_hour += timedelta(hours=1)
         
-        logger.info(f"Cached TLE data for {len(tle_cache)} hours")
-        
-        timestamp_batches = [[ts.isoformat() for ts in batch] for batch in timestamp_batches]
+        logger.info(f"Loaded TLE data for {len(tle_data)} hours")
         
         observer_data = {
             'latitude': self.latitude,
@@ -259,87 +252,141 @@ class DataProcessor:
             'altitude': self.altitude
         }
         
-        tle_cache_serializable = {
-            hour.isoformat(): df.to_dict('records') 
-            for hour, df in tle_cache.items()
+        visibility_results = {}
+        
+        for ts in tqdm(timestamps, desc="Computing visibility"):
+            # Get the current serving satellite data
+            mask = serving_df['Timestamp'] <= ts
+            if not mask.any():
+                continue
+                
+            grpc_data = serving_df[mask].iloc[-1]
+            
+            # Get TLE data for this timestamp
+            hour_key = ts.replace(minute=0, second=0, microsecond=0)
+            if hour_key not in tle_data:
+                continue
+                
+            tle_records = tle_data[hour_key]
+            visible_sats_data = []
+            
+            for sat_data in tle_records:
+                try:
+                    alt, az = get_satellite_position(
+                        sat_data, ts, observer_data['latitude'],
+                        observer_data['longitude'], observer_data['altitude'],
+                        self.satellite_data.ts
+                    )
+                    
+                    if is_valid_satellite(alt, az, grpc_data.get('tiltAngleDeg', 0), 
+                                        grpc_data.get('boresightAzimuthDeg', 0)):
+                        visible_sats_data.append({
+                            'satellite': sat_data['satellite_name'],
+                            'sat_elevation_deg': alt,
+                            'sat_azimuth_deg': az,
+                            'UT_boresight_elevation': grpc_data.get('tiltAngleDeg', 0),
+                            'UT_boresight_azimuth': grpc_data.get('boresightAzimuthDeg', 0),
+                            'desired_boresight_azimuth': grpc_data.get('desiredBoresightAzimuthDeg', 0),
+                            'desired_boresight_elevation': grpc_data.get('desiredBoresightElevationDeg', 0),
+                            'tle_line1': sat_data['tle_line1'],
+                            'tle_line2': sat_data['tle_line2']
+                        })
+                except Exception as e:
+                    logger.error(f"Error processing satellite {sat_data.get('satellite_name', 'Unknown')}: {e}")
+                    continue
+            
+            if visible_sats_data:
+                visibility_results[ts.isoformat()] = visible_sats_data
+        
+        output_file = os.path.join(self.output_dir, 'satellite_visibility.json')
+        with open(output_file, 'w') as f:
+            json.dump(visibility_results, f)
+        
+        return visibility_results
+
+    def compute_handover_visibility(self, frame_type=2):
+        """Compute visible satellites at handover times (when satellite changes)."""
+        logger.info("Computing satellite visibility at handover times")
+        combined_file = os.path.join(self.output_dir, 'combined_serving_satellite.csv')
+        if not os.path.exists(combined_file):
+            logger.info("Combined serving satellite file not found, processing data...")
+            self.process_data(self.start_time, self.end_time)
+        
+        try:
+            serving_df = pd.read_csv(combined_file)
+            serving_df['Timestamp'] = pd.to_datetime(serving_df['Timestamp'])
+            logger.info(f"Loaded combined serving satellite data with {len(serving_df)} records")
+        except Exception as e:
+            logger.error(f"Error loading combined serving satellite data: {e}")
+            return {}
+
+        # Find handover times (when satellite changes)
+        serving_df['Next_Satellite'] = serving_df['Connected_Satellite'].shift(-1)
+        handover_times = serving_df[serving_df['Connected_Satellite'] != serving_df['Next_Satellite']]['Timestamp'].unique()
+        logger.info(f"Found {len(handover_times)} handover times")
+        
+        # Load TLE data for the entire time period
+        tle_data = {}
+        current_hour = self.start_time.replace(minute=0, second=0, microsecond=0)
+        while current_hour <= self.end_time:
+            tle_data[current_hour] = self.satellite_data.load_tle_data(current_hour)
+            current_hour += timedelta(hours=1)
+        
+        logger.info(f"Loaded TLE data for {len(tle_data)} hours")
+        
+        observer_data = {
+            'latitude': self.latitude,
+            'longitude': self.longitude,
+            'altitude': self.altitude
         }
         
-        def process_batch(batch_data):
-            batch_timestamps, serving_data, observer_info, tle_data = batch_data
-            batch_results = {}
-            
-            serving_df = pd.DataFrame(serving_data)
-            serving_df['Timestamp'] = pd.to_datetime(serving_df['Timestamp'])
-            
-            for ts_str in batch_timestamps:
-                ts = datetime.fromisoformat(ts_str)
-                
-                mask = serving_df['Timestamp'] <= ts
-                if not mask.any():
-                    continue
-                    
-                grpc_data = serving_df[mask].iloc[-1]
-                
-                tilt_deg = grpc_data.get('tiltAngleDeg', 0)
-                rotation_deg = grpc_data.get('boresightAzimuthDeg', 0)
-                fov_azimuth = grpc_data.get('desiredBoresightAzimuthDeg', 0)
-                fov_elevation = grpc_data.get('desiredBoresightElevationDeg', 0)
-                
-                hour_key = ts.replace(minute=0, second=0, microsecond=0).isoformat()
-                if hour_key not in tle_data:
-                    continue
-                
-                tle_records = tle_data[hour_key]
-                visible_sats_data = []
-                
-                for sat_data in tle_records:
-                    try:
-                        alt, az = get_satellite_position(
-                            sat_data, ts, observer_info['latitude'],
-                            observer_info['longitude'], observer_info['altitude'],
-                            self.satellite_data.ts
-                        )
-                        
-                        if is_valid_satellite(alt, az, tilt_deg, rotation_deg):
-                            visible_sats_data.append({
-                                'satellite': sat_data['satellite_name'],
-                                'sat_elevation_deg': alt,
-                                'sat_azimuth_deg': az,
-                                'UT_boresight_elevation': tilt_deg,
-                                'UT_boresight_azimuth': rotation_deg,
-                                'desired_boresight_azimuth': fov_azimuth,
-                                'desired_boresight_elevation': fov_elevation,
-                                'tle_line1': sat_data['tle_line1'],
-                                'tle_line2': sat_data['tle_line2']
-                            })
-                    except Exception as e:
-                        logger.error(f"Error processing satellite {sat_data.get('satellite_name', 'Unknown')}: {e}")
-                        continue
-                
-                if visible_sats_data:
-                    batch_results[ts_str] = visible_sats_data
-            
-            return batch_results
-        
-        num_processes = min(12, mp.cpu_count())
-        output_file = os.path.join(self.output_dir, 'satellite_visibility.json')
-        
-        batch_data = [
-            (batch, serving_df.to_dict('records'), observer_data, tle_cache_serializable)
-            for batch in timestamp_batches
-        ]
-        
-        with mp.Pool(num_processes) as pool:
-            with tqdm(total=len(timestamp_batches), desc="Computing visibility at timestamps") as pbar:
-                results = []
-                for batch_result in pool.imap_unordered(process_batch, batch_data):
-                    results.append(batch_result)
-                    pbar.update(1)
-        
         visibility_results = {}
-        for batch_result in results:
-            visibility_results.update(batch_result)
         
+        for ts in tqdm(handover_times, desc="Computing handover visibility"):
+            # Get the current serving satellite data
+            mask = serving_df['Timestamp'] <= ts
+            if not mask.any():
+                continue
+                
+            grpc_data = serving_df[mask].iloc[-1]
+            
+            # Get TLE data for this timestamp
+            hour_key = ts.replace(minute=0, second=0, microsecond=0)
+            if hour_key not in tle_data:
+                continue
+                
+            tle_records = tle_data[hour_key]
+            visible_sats_data = []
+            
+            for sat_data in tle_records:
+                try:
+                    alt, az = get_satellite_position(
+                        sat_data, ts, observer_data['latitude'],
+                        observer_data['longitude'], observer_data['altitude'],
+                        self.satellite_data.ts
+                    )
+                    
+                    if is_valid_satellite(alt, az, grpc_data.get('tiltAngleDeg', 0), 
+                                        grpc_data.get('boresightAzimuthDeg', 0)):
+                        visible_sats_data.append({
+                            'satellite': sat_data['satellite_name'],
+                            'sat_elevation_deg': alt,
+                            'sat_azimuth_deg': az,
+                            'UT_boresight_elevation': grpc_data.get('tiltAngleDeg', 0),
+                            'UT_boresight_azimuth': grpc_data.get('boresightAzimuthDeg', 0),
+                            'desired_boresight_azimuth': grpc_data.get('desiredBoresightAzimuthDeg', 0),
+                            'desired_boresight_elevation': grpc_data.get('desiredBoresightElevationDeg', 0),
+                            'tle_line1': sat_data['tle_line1'],
+                            'tle_line2': sat_data['tle_line2']
+                        })
+                except Exception as e:
+                    logger.error(f"Error processing satellite {sat_data.get('satellite_name', 'Unknown')}: {e}")
+                    continue
+            
+            if visible_sats_data:
+                visibility_results[ts.isoformat()] = visible_sats_data
+        
+        output_file = os.path.join(self.output_dir, 'handover_visibility.json')
         with open(output_file, 'w') as f:
             json.dump(visibility_results, f)
         

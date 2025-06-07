@@ -27,6 +27,7 @@ logs/
 
 # Data files
 *.csv
+# allow the requirements.txt file to be committed
 *.txt
 
 # Output directories

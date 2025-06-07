@@ -8,7 +8,7 @@ This tool processes various types of satellite-related data files and combines t
 - Serving satellite data (which satellite is currently connected)
 - TLE (Two-Line Element) data for satellite orbital information
 - Ping latency measurements
-- Satellite visibility calculations
+- Satellite visibility calculations at regular intervals or handover times
 
 ## Project Structure
 
@@ -31,7 +31,9 @@ anaSAT/
 └── output/
     ├── combined_serving_satellite.csv
     ├── connection_periods.csv
-    └── satellite_visibility.json
+    ├── ping_data_by_second.json
+    ├── satellite_visibility.json
+    └── handover_visibility.json
 ```
 
 ## Environment Setup
@@ -58,6 +60,35 @@ Required packages:
 
 ## Data Processing
 
+### Ping Data Processing
+
+The tool processes ping latency measurements into a per-second format:
+
+1. Raw ping data is read from files in the format:
+   ```
+   [timestamp] ... time=latency ms
+   ```
+
+2. Data is processed into a JSON structure:
+   ```json
+   {
+     "2025-05-31T17:00:00": [
+       {
+         "time_ms": 1717167600000,
+         "latency_ms": 15.2
+       },
+       ...
+     ],
+     ...
+   }
+   ```
+
+3. Features:
+   - Processes data in one-hour chunks
+   - Handles missing files gracefully
+   - Maintains chronological order
+   - Outputs to `ping_data_by_second.json`
+
 ### Connection Periods
 
 The tool processes satellite connection data to identify distinct connection periods:
@@ -72,6 +103,26 @@ The tool processes satellite connection data to identify distinct connection per
    - Mean altitude
    - TLE information
 
+### Satellite Visibility
+
+The tool offers two modes for computing satellite visibility:
+
+1. Regular Visibility (`--compute_visibility`):
+   - Computes visibility at each timestamp in the serving data
+   - Outputs to `satellite_visibility.json`
+   - Useful for detailed analysis of satellite positions
+
+2. Handover Visibility (`--compute_handover_visibility`):
+   - Computes visibility only at satellite handover times
+   - More efficient than regular visibility computation
+   - Outputs to `handover_visibility.json`
+   - Useful for analyzing satellite transitions
+
+Both modes calculate:
+- Satellite elevation and azimuth
+- Field of View (FOV) parameters
+- TLE information for each visible satellite
+
 ### Output Files
 
 1. `combined_serving_satellite.csv`:
@@ -82,14 +133,23 @@ The tool processes satellite connection data to identify distinct connection per
    - Analysis of satellite connection periods
    - Columns: Satellite, Start_Time, End_Time, Duration_Seconds, Mean_Altitude_km, TLE_Line1, TLE_Line2, TLE_Timestamp
 
-3. `satellite_visibility.json`:
-   - Analysis of visible satellites at timestamps
+3. `ping_data_by_second.json`:
+   - Processed ping latency data
+   - Organized by second with timestamp and latency measurements
+   - Used for correlation with satellite connection periods
+
+4. `satellite_visibility.json`:
+   - Analysis of visible satellites at regular intervals
    - Contains satellite positions and visibility information
+
+5. `handover_visibility.json`:
+   - Analysis of visible satellites at handover times
+   - More focused dataset for analyzing satellite transitions
 
 ## Usage
 
 ```bash
-python src/main.py --start YYYY-MM-DD-HH-MM-SS --end YYYY-MM-DD-HH-MM-SS --lat LATITUDE --lon LONGITUDE --alt ALTITUDE [--output_dir OUTPUT_DIR]
+python src/main.py --start YYYY-MM-DD-HH-MM-SS --end YYYY-MM-DD-HH-MM-SS --lat LATITUDE --lon LONGITUDE --alt ALTITUDE [--output_dir OUTPUT_DIR] [--process_ping] [--compute_visibility] [--compute_handover_visibility]
 ```
 
 ### Arguments
@@ -100,11 +160,15 @@ python src/main.py --start YYYY-MM-DD-HH-MM-SS --end YYYY-MM-DD-HH-MM-SS --lat L
 - `--lon`: Observer's longitude in degrees (required)
 - `--alt`: Observer's altitude in meters (required)
 - `--output_dir`: Output directory for CSV files (default: 'output')
+- `--process_ping`: Flag to process ping data (optional)
+- `--compute_visibility`: Flag to compute visibility at regular intervals (optional)
+- `--compute_handover_visibility`: Flag to compute visibility at handover times (optional)
 
 ### Example
 
 ```bash
-python src/main.py --start 2025-05-31-17-00-00 --end 2025-05-31-18-00-00 --lat 37.7749 --lon -122.4194 --alt 100
+# Process data with ping and handover visibility
+python src/main.py --start 2025-05-31-17-00-00 --end 2025-05-31-18-00-00 --lat 37.7749 --lon -122.4194 --alt 100 --process_ping --compute_handover_visibility
 ```
 
 ## Features
@@ -113,7 +177,8 @@ python src/main.py --start 2025-05-31-17-00-00 --end 2025-05-31-18-00-00 --lat 3
    - Automatic TLE data matching with serving satellites
    - Precise connection period analysis with exact timestamp matching
    - Statistical calculations for each connection period
-   - Satellite visibility calculations
+   - Satellite visibility calculations at regular intervals or handover times
+   - Ping latency data processing and correlation
 
 2. **Error Handling**:
    - Graceful handling of missing files
@@ -132,3 +197,5 @@ python src/main.py --start 2025-05-31-17-00-00 --end 2025-05-31-18-00-00 --lat 3
 - Missing data is handled gracefully with appropriate warnings
 - The tool uses multiprocessing for efficient data processing
 - Detailed logging is available for debugging and monitoring
+- Ping data is processed in one-hour chunks for efficient memory usage
+- Handover visibility computation is more efficient than regular visibility computation
