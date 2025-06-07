@@ -62,13 +62,5 @@ def main():
     # Process the data
     processor.process_data(start_time, end_time, process_ping=args.process_ping)
 
-    # Compute visibility if requested
-    if args.compute_visibility:
-        processor.compute_visibility()
-
-    # Compute handover visibility if requested
-    if args.compute_handover_visibility:
-        processor.compute_handover_visibility()
-
 if __name__ == "__main__":
     main() 

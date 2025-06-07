@@ -1,12 +1,9 @@
 import os
-import json
+import re
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import List, Dict, Any, Optional
 from tqdm import tqdm
-import multiprocessing as mp
 from logger import logger
 from satellite_data import SatelliteData
 
@@ -31,20 +28,21 @@ class DataProcessor:
         self.satellite_data = SatelliteData(latitude, longitude, altitude)
         self.shared_results = None
 
-    def process_ping_data_to_json(self, start_time: datetime, end_time: datetime) -> None:
-        """Process ping data into a per-second JSON format."""
-        output_file = os.path.join(self.output_dir, 'ping_data_by_second.json')
-        ping_data_by_second = {}
+    def process_ping_data_to_csv(self, start_time: datetime, end_time: datetime) -> None:
+        """Process ping data into a clean CSV format with precise timestamps and latency measurements."""
+        output_file = os.path.join(self.output_dir, 'ping_data.csv')
+        records = []
         
-        current_time = start_time.replace(microsecond=0)
-        while current_time <= end_time:
-            ping_data_by_second[current_time.isoformat()] = []
-            current_time += timedelta(seconds=1)
+        # Ensure start_time and end_time are timezone-aware
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
         
         current_time = start_time
         total_hours = int((end_time - start_time).total_seconds() / 3600) + 1
         
-        with tqdm(total=total_hours, desc="Processing ping data by second") as pbar:
+        with tqdm(total=total_hours, desc="Processing ping data") as pbar:
             while current_time <= end_time:
                 date_str = current_time.strftime('%Y-%m-%d')
                 ping_file = os.path.join('data', 'latency', date_str, 
@@ -66,16 +64,15 @@ class DataProcessor:
                                 timestamp = float(timestamp_match.group(1))
                                 latency = float(latency_match.group(1))
                                 
+                                # Create timezone-aware datetime from timestamp
                                 ping_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
                                 
                                 if start_time <= ping_time <= end_time:
-                                    second_key = ping_time.replace(microsecond=0).isoformat()
-                                    
-                                    if second_key in ping_data_by_second:
-                                        ping_data_by_second[second_key].append({
-                                            'time_ms': timestamp * 1000,
-                                            'latency_ms': latency
-                                        })
+                                    records.append({
+                                        'timestamp': ping_time,
+                                        'time_ms': timestamp * 1000,
+                                        'latency_ms': latency
+                                    })
                     
                     except Exception as e:
                         logger.error(f"Error processing ping file {ping_file}: {e}")
@@ -86,9 +83,14 @@ class DataProcessor:
                 pbar.update(1)
         
         try:
-            with open(output_file, 'w') as f:
-                json.dump(ping_data_by_second, f, indent=2)
-            logger.info(f"Successfully wrote ping data to {output_file}")
+            # Create DataFrame and sort by timestamp
+            df = pd.DataFrame(records)
+            if not df.empty:
+                df = df.sort_values('timestamp')
+                df.to_csv(output_file, index=False)
+                logger.info(f"Successfully wrote {len(df)} ping records to {output_file}")
+            else:
+                logger.warning("No ping records found in the specified time range")
         except Exception as e:
             logger.error(f"Error writing ping data to {output_file}: {e}")
 
@@ -96,12 +98,18 @@ class DataProcessor:
         """Process all data within the specified time window."""
         logger.info(f"Processing data from {start_time} to {end_time}")
         
+        # Ensure start_time and end_time are timezone-aware
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        
         combined_file = os.path.join(self.output_dir, 'combined_serving_satellite.csv')
         periods_file = os.path.join(self.output_dir, 'connection_periods.csv')
         
         if process_ping:
-            logger.info("Processing ping data into per-second format...")
-            self.process_ping_data_to_json(start_time, end_time)
+            logger.info("Processing ping data into CSV format...")
+            self.process_ping_data_to_csv(start_time, end_time)
         
         logger.info("Combining all serving satellite data...")
         all_serving_data = []
@@ -112,7 +120,10 @@ class DataProcessor:
             try:
                 df = self.satellite_data.process_satellite_file(file_time, file_path)
                 if not df.empty:
-                    df = df[(df['Timestamp'] >= start_time) & (df['Timestamp'] <= end_time)]
+                    # Convert start_time and end_time to pandas timestamps for comparison
+                    start_ts = pd.Timestamp(start_time)
+                    end_ts = pd.Timestamp(end_time)
+                    df = df[(df['Timestamp'] >= start_ts) & (df['Timestamp'] <= end_ts)]
                     all_serving_data.append(df)
             except Exception as e:
                 logger.error(f"Error processing file {file_path}: {e}")
@@ -217,177 +228,3 @@ class DataProcessor:
             periods_df.to_csv(output_file, index=False)
         
         return periods_df
-
-    def compute_visibility(self, frame_type=2):
-        """Compute visible satellites at each timestamp in the serving data."""
-        logger.info(f"Computing satellite visibility with frame type {frame_type}")
-        combined_file = os.path.join(self.output_dir, 'combined_serving_satellite.csv')
-        if not os.path.exists(combined_file):
-            logger.info("Combined serving satellite file not found, processing data...")
-            self.process_data(self.start_time, self.end_time)
-        
-        try:
-            serving_df = pd.read_csv(combined_file)
-            serving_df['Timestamp'] = pd.to_datetime(serving_df['Timestamp'])
-            logger.info(f"Loaded combined serving satellite data with {len(serving_df)} records")
-        except Exception as e:
-            logger.error(f"Error loading combined serving satellite data: {e}")
-            return {}
-
-        # Get unique timestamps from serving data
-        timestamps = serving_df['Timestamp'].unique()
-        
-        # Load TLE data for the entire time period
-        tle_data = {}
-        current_hour = self.start_time.replace(minute=0, second=0, microsecond=0)
-        while current_hour <= self.end_time:
-            tle_data[current_hour] = self.satellite_data.load_tle_data(current_hour)
-            current_hour += timedelta(hours=1)
-        
-        logger.info(f"Loaded TLE data for {len(tle_data)} hours")
-        
-        observer_data = {
-            'latitude': self.latitude,
-            'longitude': self.longitude,
-            'altitude': self.altitude
-        }
-        
-        visibility_results = {}
-        
-        for ts in tqdm(timestamps, desc="Computing visibility"):
-            # Get the current serving satellite data
-            mask = serving_df['Timestamp'] <= ts
-            if not mask.any():
-                continue
-                
-            grpc_data = serving_df[mask].iloc[-1]
-            
-            # Get TLE data for this timestamp
-            hour_key = ts.replace(minute=0, second=0, microsecond=0)
-            if hour_key not in tle_data:
-                continue
-                
-            tle_records = tle_data[hour_key]
-            visible_sats_data = []
-            
-            for sat_data in tle_records:
-                try:
-                    alt, az = get_satellite_position(
-                        sat_data, ts, observer_data['latitude'],
-                        observer_data['longitude'], observer_data['altitude'],
-                        self.satellite_data.ts
-                    )
-                    
-                    if is_valid_satellite(alt, az, grpc_data.get('tiltAngleDeg', 0), 
-                                        grpc_data.get('boresightAzimuthDeg', 0)):
-                        visible_sats_data.append({
-                            'satellite': sat_data['satellite_name'],
-                            'sat_elevation_deg': alt,
-                            'sat_azimuth_deg': az,
-                            'UT_boresight_elevation': grpc_data.get('tiltAngleDeg', 0),
-                            'UT_boresight_azimuth': grpc_data.get('boresightAzimuthDeg', 0),
-                            'desired_boresight_azimuth': grpc_data.get('desiredBoresightAzimuthDeg', 0),
-                            'desired_boresight_elevation': grpc_data.get('desiredBoresightElevationDeg', 0),
-                            'tle_line1': sat_data['tle_line1'],
-                            'tle_line2': sat_data['tle_line2']
-                        })
-                except Exception as e:
-                    logger.error(f"Error processing satellite {sat_data.get('satellite_name', 'Unknown')}: {e}")
-                    continue
-            
-            if visible_sats_data:
-                visibility_results[ts.isoformat()] = visible_sats_data
-        
-        output_file = os.path.join(self.output_dir, 'satellite_visibility.json')
-        with open(output_file, 'w') as f:
-            json.dump(visibility_results, f)
-        
-        return visibility_results
-
-    def compute_handover_visibility(self, frame_type=2):
-        """Compute visible satellites at handover times (when satellite changes)."""
-        logger.info("Computing satellite visibility at handover times")
-        combined_file = os.path.join(self.output_dir, 'combined_serving_satellite.csv')
-        if not os.path.exists(combined_file):
-            logger.info("Combined serving satellite file not found, processing data...")
-            self.process_data(self.start_time, self.end_time)
-        
-        try:
-            serving_df = pd.read_csv(combined_file)
-            serving_df['Timestamp'] = pd.to_datetime(serving_df['Timestamp'])
-            logger.info(f"Loaded combined serving satellite data with {len(serving_df)} records")
-        except Exception as e:
-            logger.error(f"Error loading combined serving satellite data: {e}")
-            return {}
-
-        # Find handover times (when satellite changes)
-        serving_df['Next_Satellite'] = serving_df['Connected_Satellite'].shift(-1)
-        handover_times = serving_df[serving_df['Connected_Satellite'] != serving_df['Next_Satellite']]['Timestamp'].unique()
-        logger.info(f"Found {len(handover_times)} handover times")
-        
-        # Load TLE data for the entire time period
-        tle_data = {}
-        current_hour = self.start_time.replace(minute=0, second=0, microsecond=0)
-        while current_hour <= self.end_time:
-            tle_data[current_hour] = self.satellite_data.load_tle_data(current_hour)
-            current_hour += timedelta(hours=1)
-        
-        logger.info(f"Loaded TLE data for {len(tle_data)} hours")
-        
-        observer_data = {
-            'latitude': self.latitude,
-            'longitude': self.longitude,
-            'altitude': self.altitude
-        }
-        
-        visibility_results = {}
-        
-        for ts in tqdm(handover_times, desc="Computing handover visibility"):
-            # Get the current serving satellite data
-            mask = serving_df['Timestamp'] <= ts
-            if not mask.any():
-                continue
-                
-            grpc_data = serving_df[mask].iloc[-1]
-            
-            # Get TLE data for this timestamp
-            hour_key = ts.replace(minute=0, second=0, microsecond=0)
-            if hour_key not in tle_data:
-                continue
-                
-            tle_records = tle_data[hour_key]
-            visible_sats_data = []
-            
-            for sat_data in tle_records:
-                try:
-                    alt, az = get_satellite_position(
-                        sat_data, ts, observer_data['latitude'],
-                        observer_data['longitude'], observer_data['altitude'],
-                        self.satellite_data.ts
-                    )
-                    
-                    if is_valid_satellite(alt, az, grpc_data.get('tiltAngleDeg', 0), 
-                                        grpc_data.get('boresightAzimuthDeg', 0)):
-                        visible_sats_data.append({
-                            'satellite': sat_data['satellite_name'],
-                            'sat_elevation_deg': alt,
-                            'sat_azimuth_deg': az,
-                            'UT_boresight_elevation': grpc_data.get('tiltAngleDeg', 0),
-                            'UT_boresight_azimuth': grpc_data.get('boresightAzimuthDeg', 0),
-                            'desired_boresight_azimuth': grpc_data.get('desiredBoresightAzimuthDeg', 0),
-                            'desired_boresight_elevation': grpc_data.get('desiredBoresightElevationDeg', 0),
-                            'tle_line1': sat_data['tle_line1'],
-                            'tle_line2': sat_data['tle_line2']
-                        })
-                except Exception as e:
-                    logger.error(f"Error processing satellite {sat_data.get('satellite_name', 'Unknown')}: {e}")
-                    continue
-            
-            if visible_sats_data:
-                visibility_results[ts.isoformat()] = visible_sats_data
-        
-        output_file = os.path.join(self.output_dir, 'handover_visibility.json')
-        with open(output_file, 'w') as f:
-            json.dump(visibility_results, f)
-        
-        return visibility_results 

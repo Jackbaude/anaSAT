@@ -4,11 +4,10 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from skyfield.api import EarthSatellite, load, wgs84
 from concurrent.futures import ThreadPoolExecutor
 from logger import logger
-from satellite_utils import get_satellite_position, is_valid_satellite
 
 class SatelliteData:
     """Class to handle satellite data loading and processing."""
@@ -55,20 +54,38 @@ class SatelliteData:
         return pd.DataFrame(tle_records) if tle_records else pd.DataFrame(
             columns=['satellite_name', 'tle_line1', 'tle_line2', 'timestamp'])
 
-    def get_matching_serving_satellite_files(self, start_time: datetime, end_time: datetime) -> List[tuple[datetime, Path]]:
-        """Find satellite data files within the time window."""
+    def get_matching_serving_satellite_files(self, start_time: datetime, end_time: datetime) -> List[Tuple[datetime, str]]:
+        """Get all serving satellite files that match the time window."""
         logger.info(f"Searching for satellite data files between {start_time} and {end_time}")
-        files = sorted(Path("data").glob("serving_satellite_data-*.csv"))
-        logger.debug(f"Found {len(files)} total satellite data files")
-        matched = []
-        for f in files:
-            match = self.file_regex.search(f.name)
-            if match:
-                file_time = datetime.strptime(match.group(1), "%Y-%m-%d-%H-%M-%S").replace(tzinfo=timezone.utc)
-                if start_time <= file_time <= end_time:
-                    matched.append((file_time, f))
-        logger.info(f"Matched {len(matched)} files within time window")
-        return matched
+        
+        # Ensure start_time and end_time are timezone-aware
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        
+        matched_files = []
+        
+        # Walk through the data directory
+        for root, _, files in os.walk('data'):
+            for file in files:
+                if file.startswith('serving_satellite_data-'):
+                    try:
+                        # Extract timestamp from filename
+                        timestamp_str = file.replace('serving_satellite_data-', '').replace('.csv', '')
+                        file_time = datetime.strptime(timestamp_str, '%Y-%m-%d-%H-%M-%S').replace(tzinfo=timezone.utc)
+                        
+                        if start_time <= file_time <= end_time:
+                            file_path = os.path.join(root, file)
+                            matched_files.append((file_time, file_path))
+                    except ValueError as e:
+                        logger.warning(f"Could not parse timestamp from filename {file}: {e}")
+                        continue
+        
+        # Sort by timestamp
+        matched_files.sort(key=lambda x: x[0])
+        logger.info(f"Found {len(matched_files)} matching satellite data files")
+        return matched_files
 
     def process_satellite_file(self, file_time: datetime, file_path: Path) -> pd.DataFrame:
         """Process a single satellite data file."""
