@@ -32,3 +32,6 @@ logs/
 # Output directories
 *_figures/
 my_plots/ 
+
+.env
+*.zip

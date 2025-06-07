@@ -1,6 +1,6 @@
 # Satellite Data Processing Tool
 
-A Python tool for processing and analyzing Starlink satellite connection data, including serving satellite information, latency measurements, GRPC status data, and satellite visibility calculations.
+A Python tool for processing and analyzing Starlink satellite connection data, including serving satellite information, latency measurements, and satellite visibility calculations.
 
 ## Overview
 
@@ -8,74 +8,88 @@ This tool processes various types of satellite-related data files and combines t
 - Serving satellite data (which satellite is currently connected)
 - TLE (Two-Line Element) data for satellite orbital information
 - Ping latency measurements
-- GRPC status data
-- Satellite visibility calculations and Field of View (FOV) analysis
+- Satellite visibility calculations
 
-## Data Structure
-
-The tool expects data files to be organized in the following structure:
+## Project Structure
 
 ```
-data/
-├── serving_satellite_data-YYYY-MM-DD-HH-MM-SS.csv
-├── TLE/
-│   └── YYYY-MM-DD/
-│       └── starlink-tle-YYYY-MM-DD-HH-MM-SS.txt
-├── latency/
-│   └── YYYY-MM-DD/
-│       └── ping-100ms-YYYY-MM-DD-HH-MM-SS.txt
-└── grpc/
-    └── YYYY-MM-DD/
-        └── GRPC_STATUS-YYYY-MM-DD-HH-MM-SS.csv
+anaSAT/
+├── src/
+│   ├── data_processor.py    # Main data processing logic
+│   ├── satellite_data.py    # Satellite data handling
+│   ├── satellite_utils.py   # Utility functions
+│   ├── logger.py           # Logging configuration
+│   └── main.py             # Entry point
+├── data/
+│   ├── serving_satellite_data-YYYY-MM-DD-HH-MM-SS.csv
+│   ├── TLE/
+│   │   └── YYYY-MM-DD/
+│   │       └── starlink-tle-YYYY-MM-DD-HH-MM-SS.txt
+│   └── latency/
+│       └── YYYY-MM-DD/
+│           └── ping-10ms-YYYY-MM-DD-HH-MM-SS.txt
+└── output/
+    ├── combined_serving_satellite.csv
+    ├── connection_periods.csv
+    └── satellite_visibility.json
 ```
 
-### Input File Formats
+## Environment Setup
 
-1. **Serving Satellite Data** (`serving_satellite_data-*.csv`):
-   - Contains information about which satellite is currently serving
-   - Columns: Timestamp, Connected_Satellite, Distance, etc.
+1. Create and activate a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Linux/Mac
+# or
+.\venv\Scripts\activate  # On Windows
+```
 
-2. **TLE Data** (`starlink-tle-*.txt`):
-   - Contains orbital elements for Starlink satellites
-   - Format: Three lines per satellite (name, line1, line2)
+2. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-3. **Ping Data** (`ping-100ms-*.txt`):
-   - Contains latency measurements
-   - Format: `[timestamp] ... time=latency ms`
+Required packages:
+- pandas
+- numpy
+- tqdm
+- skyfield
+- python-dateutil
 
-4. **GRPC Status** (`GRPC_STATUS-*.csv`):
-   - Contains GRPC connection status and metrics
-   - Columns: timestamp, popPingLatencyMs, downlinkThroughputBps, uplinkThroughputBps, tiltAngleDeg, boresightAzimuthDeg
+## Data Processing
 
-## Output Files
+### Connection Periods
 
-The tool generates the following output files in the specified output directory:
+The tool processes satellite connection data to identify distinct connection periods:
+
+1. Data is sorted chronologically
+2. Connection periods are identified by:
+   - Changes in satellite ID
+   - Gaps in consecutive timestamps (must be exactly 1 second apart)
+3. For each period, the following is calculated:
+   - Start and end times
+   - Duration in seconds
+   - Mean altitude
+   - TLE information
+
+### Output Files
 
 1. `combined_serving_satellite.csv`:
    - Combined serving satellite data with TLE information
    - Columns: Timestamp, Connected_Satellite, Distance, TLE_Line1, TLE_Line2, TLE_Timestamp
 
-2. `combined_ping_data.csv`:
-   - Combined ping latency measurements
-   - Columns: Timestamp, Latency_ms
-
-3. `combined_grpc_data.csv`:
-   - Combined GRPC status data
-   - Columns: timestamp, popPingLatencyMs, downlinkThroughputBps, uplinkThroughputBps
-
-4. `connection_periods.csv`:
+2. `connection_periods.csv`:
    - Analysis of satellite connection periods
-   - Columns: Satellite, Start_Time, End_Time, Duration_Seconds, Max_Distance, Min_Distance, First_Distance, Last_Distance, Mean_Distance, Std_Distance, TLE_Line1, TLE_Line2, TLE_Timestamp
+   - Columns: Satellite, Start_Time, End_Time, Duration_Seconds, Mean_Altitude_km, TLE_Line1, TLE_Line2, TLE_Timestamp
 
-5. `satellite_visibility.json`:
-   - Analysis of visible satellites at handover timestamps
-   - Contains satellite positions and FOV information
-   - Includes altitude, azimuth, and FOV parameters for each visible satellite
+3. `satellite_visibility.json`:
+   - Analysis of visible satellites at timestamps
+   - Contains satellite positions and visibility information
 
 ## Usage
 
 ```bash
-python process_satellite_data.py --start YYYY-MM-DD-HH-MM-SS --end YYYY-MM-DD-HH-MM-SS --lat LATITUDE --lon LONGITUDE --alt ALTITUDE [--output_dir OUTPUT_DIR]
+python src/main.py --start YYYY-MM-DD-HH-MM-SS --end YYYY-MM-DD-HH-MM-SS --lat LATITUDE --lon LONGITUDE --alt ALTITUDE [--output_dir OUTPUT_DIR]
 ```
 
 ### Arguments
@@ -90,63 +104,31 @@ python process_satellite_data.py --start YYYY-MM-DD-HH-MM-SS --end YYYY-MM-DD-HH
 ### Example
 
 ```bash
-python process_satellite_data.py --start 2025-04-20-23-00-00 --end 2025-05-02-19-00-00 --lat 37.7749 --lon -122.4194 --alt 100 --output_dir analysis_results
+python src/main.py --start 2025-05-31-17-00-00 --end 2025-05-31-18-00-00 --lat 37.7749 --lon -122.4194 --alt 100
 ```
 
 ## Features
 
-1. **Progress Tracking**:
-   - Progress bars for file loading and processing
-   - Real-time status updates
-   - Estimated time remaining
+1. **Data Processing**:
+   - Automatic TLE data matching with serving satellites
+   - Precise connection period analysis with exact timestamp matching
+   - Statistical calculations for each connection period
+   - Satellite visibility calculations
 
 2. **Error Handling**:
    - Graceful handling of missing files
    - Warning messages for missing data
    - Detailed error reporting
 
-3. **Data Processing**:
-   - Automatic TLE data matching with serving satellites
-   - Connection period analysis
-   - Statistical calculations for each connection period
-   - Satellite visibility calculations
-   - Field of View (FOV) analysis
-
-4. **Satellite Visibility**:
-   - Calculates visible satellites at handover timestamps
-   - Determines if satellites are within the dish's FOV
-   - Accounts for dish tilt and rotation
-   - Uses elliptical FOV model for accurate visibility determination
-
-5. **Output Organization**:
-   - Chronologically sorted data
-   - Combined datasets for easy analysis
-   - Comprehensive connection period analysis
-   - JSON output for satellite visibility data
-
-## Dependencies
-
-- Python 3.6+
-- pandas
-- numpy
-- tqdm
-- skyfield (for satellite position calculations)
-
-## Installation
-
-1. Clone the repository
-2. Install dependencies:
-```bash
-pip install pandas numpy tqdm skyfield
-```
+3. **Progress Tracking**:
+   - Progress bars for file loading and processing
+   - Real-time status updates
+   - Detailed logging
 
 ## Notes
 
-- The tool processes data in one-minute intervals
-- TLE data is matched with serving satellite data at each timestamp
-- Connection periods are determined by changes in the serving satellite
-- Missing data is handled gracefully with appropriate warnings
 - All timestamps are in UTC
-- Satellite visibility is calculated using an elliptical FOV model
-- The FOV model accounts for dish tilt and rotation
-- Handover timestamps are generated at 12, 27, 42, and 57 seconds of each minute
+- Connection periods require exactly consecutive timestamps (1-second intervals)
+- Missing data is handled gracefully with appropriate warnings
+- The tool uses multiprocessing for efficient data processing
+- Detailed logging is available for debugging and monitoring
