@@ -139,12 +139,25 @@ class SatelliteData:
             return pd.DataFrame()
 
         if not grpc_df.empty:
+            # Convert timestamp to datetime if it's not already
+            if not pd.api.types.is_datetime64_any_dtype(grpc_df['timestamp']):
+                grpc_df['timestamp'] = pd.to_datetime(grpc_df['timestamp'], unit='s', utc=True)
+            
+            # Rename timestamp column to match satellite data
             grpc_df = grpc_df.rename(columns={'timestamp': 'Timestamp'})
+            
+            # Get all gRPC columns except Timestamp
             grpc_columns = [col for col in grpc_df.columns if col != 'Timestamp']
             logger.debug(f"Merging with gRPC columns: {grpc_columns}")
+            
+            # Sort both dataframes by timestamp
+            satellite_df = satellite_df.sort_values('Timestamp')
+            grpc_df = grpc_df.sort_values('Timestamp')
+            
+            # Merge using merge_asof to handle nearest timestamp matching
             satellite_df = pd.merge_asof(
-                satellite_df.sort_values('Timestamp'),
-                grpc_df[['Timestamp'] + grpc_columns].sort_values('Timestamp'),
+                satellite_df,
+                grpc_df[['Timestamp'] + grpc_columns],
                 on='Timestamp',
                 direction='nearest',
                 tolerance=self.merge_tolerance
@@ -152,3 +165,48 @@ class SatelliteData:
             logger.info(f"After merge: {len(satellite_df)} records")
 
         return satellite_df 
+
+    def get_matching_grpc_files(self, start_time: datetime, end_time: datetime) -> List[Tuple[datetime, str]]:
+        """Get all gRPC files that match the time window."""
+        logger.info(f"Searching for gRPC data files between {start_time} and {end_time}")
+        
+        # Ensure start_time and end_time are timezone-aware
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        
+        matched_files = []
+        
+        # Walk through the data/grpc directory
+        for root, _, files in os.walk(os.path.join('data', 'grpc')):
+            for file in files:
+                if file.startswith('GRPC_STATUS-'):
+                    try:
+                        # Extract timestamp from filename
+                        timestamp_str = file.replace('GRPC_STATUS-', '').replace('.csv', '')
+                        file_time = datetime.strptime(timestamp_str, '%Y-%m-%d-%H-%M-%S').replace(tzinfo=timezone.utc)
+                        
+                        if start_time <= file_time <= end_time:
+                            file_path = os.path.join(root, file)
+                            matched_files.append((file_time, file_path))
+                    except ValueError as e:
+                        logger.warning(f"Could not parse timestamp from filename {file}: {e}")
+                        continue
+        
+        # Sort by timestamp
+        matched_files.sort(key=lambda x: x[0])
+        logger.info(f"Found {len(matched_files)} matching gRPC data files")
+        return matched_files
+
+    def process_grpc_file(self, file_time: datetime, file_path: Path) -> pd.DataFrame:
+        """Process a single gRPC data file."""
+        logger.info(f"Processing gRPC file: {file_path}")
+        
+        try:
+            df = pd.read_csv(file_path)
+            logger.debug(f"Loaded {len(df)} records from {file_path}")
+            return df
+        except Exception as e:
+            logger.error(f"Error reading {file_path}: {e}")
+            return pd.DataFrame() 
