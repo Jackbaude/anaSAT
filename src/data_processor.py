@@ -376,36 +376,52 @@ class DataProcessor:
         # Convert timestamps to strings for caching
         timestamp_strings = [ts.isoformat() for ts in timestamps]
         
-        # Determine number of processes (use 75% of available CPUs)
-        num_processes = max(1, int(multiprocessing.cpu_count() * 0.75))
+        # Determine number of processes (use 50% of available CPUs to be more conservative)
+        num_processes = max(1, int(multiprocessing.cpu_count() * 0.5))
         logger.info(f"Using {num_processes} processes for parallel computation")
         
-        # Compute visibility in parallel
+        # Process in smaller chunks to manage memory
+        chunk_size = 1000  # Process 1000 timestamps at a time
         visibility_data = {}
-        with ProcessPoolExecutor(max_workers=num_processes) as executor:
-            # Submit all tasks
-            future_to_timestamp = {
-                executor.submit(self._compute_visibility_worker, ts_str): ts_str 
-                for ts_str in timestamp_strings
-            }
+        
+        for i in range(0, len(timestamp_strings), chunk_size):
+            chunk = timestamp_strings[i:i + chunk_size]
+            logger.info(f"Processing chunk {i//chunk_size + 1} of {(len(timestamp_strings) + chunk_size - 1)//chunk_size}")
             
-            # Process results as they complete
-            for future in tqdm(as_completed(future_to_timestamp), total=len(timestamp_strings), 
-                             desc="Computing visibility"):
-                ts_str, visible_satellites = future.result()
-                if visible_satellites:
-                    visibility_data[ts_str] = visible_satellites
-                    logger.info(f"Timestamp {ts_str}: Found {len(visible_satellites)} visible satellites")
-                else:
-                    logger.info(f"Timestamp {ts_str}: No visible satellites")
+            try:
+                with ProcessPoolExecutor(max_workers=num_processes) as executor:
+                    # Submit all tasks in this chunk
+                    future_to_timestamp = {
+                        executor.submit(self._compute_visibility_worker, ts_str): ts_str 
+                        for ts_str in chunk
+                    }
+                    
+                    # Process results as they complete
+                    for future in tqdm(as_completed(future_to_timestamp), total=len(chunk), 
+                                     desc=f"Computing visibility (chunk {i//chunk_size + 1})"):
+                        try:
+                            ts_str, visible_satellites = future.result()
+                            if visible_satellites:
+                                visibility_data[ts_str] = visible_satellites
+                                logger.info(f"Timestamp {ts_str}: Found {len(visible_satellites)} visible satellites")
+                            else:
+                                logger.info(f"Timestamp {ts_str}: No visible satellites")
+                        except Exception as e:
+                            logger.error(f"Error processing timestamp {future_to_timestamp[future]}: {e}")
+                            continue
+                
+                # Save intermediate results after each chunk
+                output_file = os.path.join(self.output_dir, 'reconfiguration_visibility.json')
+                import json
+                with open(output_file, 'w') as f:
+                    json.dump(visibility_data, f, indent=2)
+                logger.info(f"Saved intermediate results to {output_file}")
+                
+            except Exception as e:
+                logger.error(f"Error processing chunk {i//chunk_size + 1}: {e}")
+                continue
         
-        # Save to JSON file
-        output_file = os.path.join(self.output_dir, 'reconfiguration_visibility.json')
-        import json
-        with open(output_file, 'w') as f:
-            json.dump(visibility_data, f, indent=2)
-        
-        logger.info(f"Saved visibility data to {output_file}")
+        logger.info(f"Completed visibility computation with {len(visibility_data)} timestamps")
         return visibility_data
 
     def compute_visibility_at_timestamp(self, timestamp: datetime) -> list:
