@@ -203,7 +203,7 @@ class DataProcessor:
             logger.info("Processing ping data into CSV format...")
             self.process_ping_data_to_csv(start_time, end_time)
         
-        logger.info("Combining all serving satellite data...")
+        logger.info("Loading processed obstruction data...")
         all_serving_data = []
         
         # Get and process satellite data files
@@ -229,27 +229,43 @@ class DataProcessor:
         combined_df = pd.concat(all_serving_data, ignore_index=True)
         combined_df = combined_df.sort_values('Timestamp')
         
-        # Get and process gRPC data files
-        logger.info("Loading gRPC data...")
-        all_grpc_data = []
+        # Get and process obstruction data files
+        logger.info("Loading processed obstruction data...")
+        all_obstruction_data = []
         
-        grpc_files = self.satellite_data.get_matching_grpc_files(start_time, end_time)
+        # Get all processed obstruction data files in the time range
+        current_time = start_time
+        while current_time <= end_time:
+            date_str = current_time.strftime('%Y-%m-%d')
+            hour_str = current_time.strftime('%H')
+            minute_str = current_time.strftime('%M')
+            
+            obstruction_file = os.path.join('data', f'processed_obstruction-data-{date_str}-{hour_str}-{minute_str}-00.csv')
+            
+            if os.path.exists(obstruction_file):
+                try:
+                    df = pd.read_csv(obstruction_file)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    all_obstruction_data.append(df)
+                except Exception as e:
+                    logger.error(f"Error processing obstruction file {obstruction_file}: {e}")
+            
+            current_time += timedelta(minutes=1)
         
-        for file_time, file_path in tqdm(grpc_files, desc="Loading gRPC files"):
-            try:
-                df = self.satellite_data.process_grpc_file(file_time, file_path)
-                if not df.empty:
-                    all_grpc_data.append(df)
-            except Exception as e:
-                logger.error(f"Error processing gRPC file {file_path}: {e}")
-                continue
-        
-        # Merge gRPC data if available
-        if all_grpc_data:
-            grpc_df = pd.concat(all_grpc_data, ignore_index=True)
-            grpc_df = grpc_df.sort_values('timestamp')
-            logger.info(f"Merging {len(grpc_df)} gRPC records with satellite data")
-            combined_df = self.satellite_data.merge_satellite_data(combined_df, grpc_df)
+        # Merge obstruction data if available
+        if all_obstruction_data:
+            obstruction_df = pd.concat(all_obstruction_data, ignore_index=True)
+            obstruction_df = obstruction_df.sort_values('timestamp')
+            logger.info(f"Merging {len(obstruction_df)} obstruction records with satellite data")
+            
+            # Merge on timestamp
+            combined_df = pd.merge_asof(
+                combined_df,
+                obstruction_df,
+                left_on='Timestamp',
+                right_on='timestamp',
+                direction='nearest'
+            )
         
         combined_df.to_csv(combined_file, index=False)
         logger.info(f"Saved combined serving satellite data with {len(combined_df)} records")
@@ -297,60 +313,108 @@ class DataProcessor:
         else:
             return 110.0
 
-    def is_inside_fov(self, sat_elevation: float, sat_azimuth: float, 
-                     tilt_angle: float, boresight_azimuth: float, 
-                     fov_radius: float) -> bool:
+
+    def altaz_to_unit_vector(self, alt_deg, az_deg):
+        """Convert (alt, az) in degrees to a 3D unit vector."""
+        alt_rad = math.radians(alt_deg)
+        az_rad = math.radians(az_deg)
+        x = math.cos(alt_rad) * math.cos(az_rad)
+        y = math.cos(alt_rad) * math.sin(az_rad)
+        z = math.sin(alt_rad)
+        return (x, y, z)
+
+    def angular_separation(self, vec1, vec2):
+        """Compute angular separation (in degrees) between two unit vectors."""
+        dot = sum(a * b for a, b in zip(vec1, vec2))
+        dot = max(min(dot, 1.0), -1.0)  # Clamp for numerical stability
+        return math.degrees(math.acos(dot))
+
+    # IGNORE RIGHT NOW, SATLLITES NOT ALWAYS IN THE FOV?
+    def is_inside_fov(self, sat_alt, sat_az, tilt_deg, rotation_deg):
         """
-        Check if a satellite is inside the FOV using a 3D cone angle check.
-        
+        Check if satellite is within angular cone of dish boresight.
+
         Args:
-            sat_elevation: Satellite elevation in degrees
-            sat_azimuth: Satellite azimuth in degrees
-            tilt_angle: Antenna tilt angle in degrees
-            boresight_azimuth: Boresight azimuth in degrees
-            fov_radius: FOV radius in degrees
-            
+            sat_alt (float): Satellite altitude (degrees)
+            sat_az (float): Satellite azimuth (degrees)
+            tilt_deg (float): Dish tilt from zenith (degrees)
+            rotation_deg (float): Dish boresight azimuth direction (degrees)
+            base_radius (float): Half-angle of the conical FOV (degrees)
+
         Returns:
             bool: True if satellite is inside FOV, False otherwise
         """
-        if sat_elevation is None or sat_azimuth is None:
+        if sat_alt is None or sat_az is None:
             return False
 
-        # Convert angles to radians
-        sat_elev_rad = math.radians(sat_elevation)
-        sat_az_rad = math.radians(sat_azimuth)
-        tilt_rad = math.radians(tilt_angle)
-        bore_az_rad = math.radians(boresight_azimuth)
-
-        # Convert satellite position to unit vector
-        # Using spherical to Cartesian conversion
-        sat_x = math.cos(sat_elev_rad) * math.cos(sat_az_rad)
-        sat_y = math.cos(sat_elev_rad) * math.sin(sat_az_rad)
-        sat_z = math.sin(sat_elev_rad)
-        sat_vector = np.array([sat_x, sat_y, sat_z])
-
-        # Convert boresight direction to unit vector
-        # First rotate by tilt angle in elevation
-        bore_x = math.cos(tilt_rad)
-        bore_y = 0
-        bore_z = math.sin(tilt_rad)
+        sat_vec = self.altaz_to_unit_vector(sat_alt, sat_az)
+        boresight_alt = 90 - tilt_deg  # zenith is 90
+        boresight_vec = self.altaz_to_unit_vector(boresight_alt, rotation_deg)
         
-        # Then rotate by boresight azimuth
-        cos_az = math.cos(bore_az_rad)
-        sin_az = math.sin(bore_az_rad)
-        bore_vector = np.array([
-            bore_x * cos_az - bore_y * sin_az,
-            bore_x * sin_az + bore_y * cos_az,
-            bore_z
-        ])
+        separation = self.angular_separation(sat_vec, boresight_vec)
+        # return separation <= base_radius
+        if sat_alt > 20:
+            return True
 
-        # Calculate angle between satellite and boresight vectors
-        dot_product = np.clip(np.dot(sat_vector, bore_vector), -1.0, 1.0)
-        angle_rad = math.acos(dot_product)
-        angle_deg = math.degrees(angle_rad)
+    # def is_inside_fov(self, alt, az, tilt_deg, rotation_deg, base_radius=55):
+    #     """
+    #     Check if a satellite is within the valid elliptical FOV projected on the dome.
 
-        # Check if angle is within FOV radius
-        return angle_deg <= fov_radius
+    #     Args:
+    #         alt (float): Satellite altitude in degrees (0 = horizon, 90 = zenith)
+    #         az (float): Satellite azimuth in degrees (0 = north, increasing clockwise)
+    #         tilt_deg (float): Dish tilt angle in degrees (0 = pointing at zenith)
+    #         rotation_deg (float): Dish boresight rotation angle in degrees (rotation of ellipse)
+    #         base_radius (float): Base radius of the circular FOV before tilt distortion
+
+    #     Returns:
+    #         bool: True if satellite is inside the elliptical FOV, False otherwise
+    #     """
+    #     if alt is None or az is None:
+    #         return False
+
+    #     # Convert alt/az to polar plot coordinates (r = 90 - alt to map zenith to center)
+    #     r = 90 - alt
+    #     theta = math.radians(az)
+
+    #     # Convert polar to Cartesian (x, y) - satellite position on dome projection
+    #     x = r * math.cos(theta)
+    #     y = r * math.sin(theta)
+
+    #     # Calculate dish boresight direction after tilt and rotation
+    #     # Tilt rotates the boresight away from zenith in the direction of rotation_deg
+    #     boresight_alt = 90 - tilt_deg  # altitude of dish boresight
+    #     boresight_az = rotation_deg    # azimuth of dish boresight direction
+        
+    #     # Convert boresight to Cartesian coordinates
+    #     boresight_r = 90 - boresight_alt
+    #     boresight_theta = math.radians(boresight_az)
+    #     boresight_x = boresight_r * math.cos(boresight_theta)
+    #     boresight_y = boresight_r * math.sin(boresight_theta)
+
+    #     # Translate coordinates so dish boresight is at origin
+    #     dx = x - boresight_x
+    #     dy = y - boresight_y
+
+    #     # For a tilted dish, the FOV becomes elliptical when projected onto the dome
+    #     # The ellipse is stretched in the direction perpendicular to the tilt
+        
+    #     # Rotate coordinates to align with tilt direction (boresight direction)
+    #     angle_rad = math.radians(-rotation_deg)
+    #     dx_rot = dx * math.cos(angle_rad) - dy * math.sin(angle_rad)
+    #     dy_rot = dx * math.sin(angle_rad) + dy * math.cos(angle_rad)
+
+    #     # Calculate ellipse parameters
+    #     # Along tilt direction (x-axis after rotation): compressed by cos(tilt)
+    #     # Perpendicular to tilt (y-axis after rotation): unchanged
+    #     tilt_rad = math.radians(tilt_deg)
+    #     x_radius = base_radius * math.cos(tilt_rad)  # compressed
+    #     y_radius = base_radius  # unchanged
+
+    #     # Ellipse equation: (dx_rot / x_radius)^2 + (dy_rot / y_radius)^2 <= 1
+    #     inside = (dx_rot**2 / x_radius**2) + (dy_rot**2 / y_radius**2) <= 1
+    #     return inside
+        
 
     @lru_cache(maxsize=1000)
     def _get_cached_tle_data(self, timestamp_str: str) -> pd.DataFrame:
@@ -438,33 +502,33 @@ class DataProcessor:
         
         # Get the observer's location
         observer = self.satellite_data.ts.from_datetime(timestamp)
-        location = wgs84.latlon(self.latitude, self.longitude, self.altitude / 1000.0)  # Convert altitude to km
+        location = wgs84.latlon(self.latitude, self.longitude, self.altitude)  # alt in meters
         
         # Get antenna parameters from serving satellite data
-        try:
-            # Read the combined serving satellite file
-            combined_file = os.path.join(self.output_dir, 'combined_serving_satellite.csv')
-            if os.path.exists(combined_file):
-                df = pd.read_csv(combined_file)
-                df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        # try:
+        #     # Read the combined serving satellite file
+        #     combined_file = os.path.join(self.output_dir, 'combined_serving_satellite.csv')
+        #     if os.path.exists(combined_file):
+        #         df = pd.read_csv(combined_file)
+        #         df['Timestamp'] = pd.to_datetime(df['Timestamp'])
                 
-                # Find the closest timestamp
-                df['time_diff'] = abs(df['Timestamp'] - timestamp)
-                closest_row = df.loc[df['time_diff'].idxmin()]
+        #         # Find the closest timestamp
+        #         df['time_diff'] = abs(df['Timestamp'] - timestamp)
+        #         closest_row = df.loc[df['time_diff'].idxmin()]
                 
-                # Get antenna parameters
-                tilt_angle = closest_row['tiltAngleDeg']
-                boresight_azimuth = closest_row['boresightAzimuthDeg']
+        #         # Get antenna parameters
+        #         # tilt_angle = closest_row['tiltAngleDeg']
+        #         # boresight_azimuth = closest_row['boresightAzimuthDeg']
                 
-                # Get hardware version to determine FOV
-                hardware_version = closest_row['hardwareVersion']
-                fov_radius = self.get_fov_degree_from_model(hardware_version) / 2.0
-            else:
-                logger.warning(f"Combined serving satellite file not found: {combined_file}")
-                return visible_satellites
-        except Exception as e:
-            logger.error(f"Error reading antenna parameters: {e}")
-            return visible_satellites
+        #         # Get hardware version to determine FOV
+        #         # hardware_version = closest_row['hardwareVersion']
+        #         # fov_radius = self.get_fov_degree_from_model(hardware_version) / 2.0
+        #     else:
+        #         logger.warning(f"Combined serving satellite file not found: {combined_file}")
+        #         return visible_satellites
+        # except Exception as e:
+        #     logger.error(f"Error reading antenna parameters: {e}")
+        #     return visible_satellites
         
         # Pre-allocate arrays for satellite positions
         n_satellites = len(tle_data)
@@ -495,17 +559,12 @@ class DataProcessor:
         
         # Check visibility for each satellite
         for i, (elevation, azimuth, sat_name) in enumerate(zip(elevations, azimuths, satellite_names)):
-            if elevation > 20 and self.is_inside_fov(
-                elevation, azimuth, tilt_angle, boresight_azimuth, fov_radius):
+            if elevation > 20:
                 row = tle_data.iloc[i]
                 visible_satellites.append({
                     "satellite": sat_name,
                     "sat_elevation_deg": elevation,
                     "sat_azimuth_deg": azimuth,
-                    "UT_boresight_elevation": tilt_angle,
-                    "UT_boresight_azimuth": boresight_azimuth,
-                    "desired_boresight_azimuth": closest_row['desiredBoresightAzimuthDeg'],
-                    "desired_boresight_elevation": closest_row['desiredBoresightElevationDeg'],
                     "tle_line1": row['tle_line1'],
                     "tle_line2": row['tle_line2']
                 })

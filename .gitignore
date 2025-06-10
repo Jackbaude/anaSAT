@@ -36,3 +36,5 @@ my_plots/
 
 .env
 *.zip
+reconfiguration_visibility.json
+output*/
